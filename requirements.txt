@@ -5,6 +5,7 @@ PyPDF2
 qrcode
 pypandoc
 docx2pdf
-comtypes
-pywin32
-spire-presentation
+rich
+markdown-it-py
+pygments
+mdurl
