@@ -1,8 +1,12 @@
-# wo3_autoprint_streamlit_firestore_sender_upgraded.py
-# Streamlit sender (upgraded) — uses wo3_autoprint_fixed_pages.FileConverter
-# Run: streamlit run wo3_autoprint_streamlit_firestore_sender_upgraded.py
+# wo3_autoprint_streamlit_full_upgraded.py
+# Upgraded Autoprint Streamlit app
+# - Uses wo3_autoprint_fixed_pages.FileConverter when available
+# - Safe temp cleanup, environment diagnostics
+# - Chunked Firestore upload, job_id polling for payinfo
+# Run: streamlit run wo3_autoprint_streamlit_full_upgraded.py
 
 import streamlit as st
+import streamlit.components.v1 as components
 import os
 import tempfile
 import base64
@@ -10,12 +14,20 @@ import time
 import json
 import logging
 import traceback
-import uuid
-import datetime
-from typing import List, Optional
+import shutil
+import subprocess
+import platform
+from typing import Optional, List, Dict, Any
+from dataclasses import dataclass
+from fpdf import FPDF
+from PIL import Image
+from pathlib import Path
 import hashlib
+import datetime
+import uuid
+import io
 
-# Firestore
+# Firestore (soft import)
 try:
     import firebase_admin
     from firebase_admin import credentials, firestore
@@ -24,23 +36,112 @@ except Exception:
     credentials = None
     firestore = None
 
-# import conversion utilities from the module you supplied
+# Optional QR
 try:
-    from wo3_autoprint_fixed_pages import FileConverter, ConvertedFile, PrintSettings, count_pdf_pages  # user module
+    import qrcode
+    QR_AVAILABLE = True
 except Exception:
-    # fallback minimal local definitions if import fails (to avoid crash while debugging)
-    FileConverter = None
-    ConvertedFile = None
-    PrintSettings = None
+    QR_AVAILABLE = False
+
+# Try to import your conversion module
+try:
+    from wo3_autoprint_fixed_pages import FileConverter, ConvertedFile, PrintSettings, count_pdf_pages
+    USING_USER_MODULE = True
+except Exception:
+    USING_USER_MODULE = False
+    # Minimal fallback classes/functions so app doesn't crash
+    @dataclass
+    class PrintSettings:
+        copies: int = 1
+        color_mode: str = "Color"
+        duplex: str = "Single-sided"
+        paper_size: str = "A4"
+        orientation: str = "Portrait"
+        quality: str = "High"
+        collate: bool = True
+        staple: bool = False
+
+    @dataclass
+    class ConvertedFile:
+        orig_name: str
+        pdf_name: str
+        pdf_bytes: bytes
+        settings: PrintSettings
+        original_bytes: Optional[bytes] = None
+
+    class FileConverter:
+        SUPPORTED_TEXT_EXTENSIONS = {'.txt', '.md', '.rtf', '.html', '.htm'}
+        SUPPORTED_IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.webp'}
+
+        @classmethod
+        def convert_text_to_pdf_bytes(cls, file_content: bytes, encoding='utf-8') -> Optional[bytes]:
+            try:
+                text = file_content.decode(encoding, errors='ignore')
+                pdf = FPDF(unit='mm', format='A4')
+                pdf.set_auto_page_break(auto=True, margin=15)
+                pdf.add_page()
+                pdf.set_font("Helvetica", size=11)
+                for line in text.splitlines():
+                    pdf.multi_cell(0, 6, line)
+                return pdf.output(dest='S').encode('latin-1', errors='replace')
+            except Exception:
+                return None
+
+        @classmethod
+        def convert_image_to_pdf_bytes(cls, file_content: bytes) -> Optional[bytes]:
+            try:
+                from io import BytesIO
+                with Image.open(io.BytesIO(file_content)) as img:
+                    if img.mode != 'RGB':
+                        img = img.convert('RGB')
+                    out = io.BytesIO()
+                    img.thumbnail((2000, 2000))
+                    img.save(out, format='PDF')
+                    return out.getvalue()
+            except Exception:
+                return None
+
+        @classmethod
+        def convert_uploaded_file_to_pdf_bytes(cls, uploaded_file) -> Optional[bytes]:
+            if not uploaded_file:
+                return None
+            suffix = os.path.splitext(uploaded_file.name)[1].lower()
+            content = uploaded_file.getvalue()
+            try:
+                if suffix == ".pdf":
+                    return content
+                if suffix in cls.SUPPORTED_TEXT_EXTENSIONS:
+                    return cls.convert_text_to_pdf_bytes(content)
+                if suffix in cls.SUPPORTED_IMAGE_EXTENSIONS:
+                    return cls.convert_image_to_pdf_bytes(content)
+            except Exception:
+                return None
+            return None
+
     def count_pdf_pages(blob: Optional[bytes]) -> int:
+        # minimal fallback
         return 1
 
-# logging
-LOGFILE = os.path.join(tempfile.gettempdir(), f"autoprint_sender_upgraded_{int(time.time())}.log")
-logger = logging.getLogger("autoprint_sender_upgraded")
+# -------- logging with safe logfile creation ----------
+def make_logfile():
+    # try tmp, else fallback to ~/.cache/autoprint
+    tdir = tempfile.gettempdir()
+    try:
+        os.makedirs(tdir, exist_ok=True)
+        path = os.path.join(tdir, f"autoprint_sender_{int(time.time())}.log")
+        fh = logging.FileHandler(path, encoding="utf-8")
+        return path, fh
+    except Exception:
+        alt_dir = os.path.expanduser("~/.cache/autoprint")
+        os.makedirs(alt_dir, exist_ok=True)
+        path = os.path.join(alt_dir, f"autoprint_sender_{int(time.time())}.log")
+        fh = logging.FileHandler(path, encoding="utf-8")
+        return path, fh
+
+LOGFILE, fh = make_logfile()
+logger = logging.getLogger("autoprint_sender_full")
 logger.setLevel(logging.DEBUG)
 if not logger.handlers:
-    fh = logging.FileHandler(LOGFILE, encoding="utf-8")
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(logging.Formatter("%(asctime)s — %(levelname)s — %(message)s"))
     logger.addHandler(fh)
@@ -55,50 +156,119 @@ def log(msg: str, level: str = "info"):
     else:
         logger.info(msg)
 
-# helpers
-def sha256_bytes(b: bytes) -> str:
-    return hashlib.sha256(b).hexdigest()
+# -------- utilities ----------
+def safe_remove(path: str):
+    try:
+        if path and os.path.exists(path):
+            os.unlink(path)
+    except Exception as e:
+        log(f"safe_remove({path}) failed: {e}", "warning")
 
-def meta_doc_id(file_id: str) -> str:
-    return f"{file_id}_meta"
+def find_executable(names):
+    for name in names:
+        if os.path.exists(name):
+            return name
+        path = shutil.which(name)
+        if path:
+            return path
+    return None
 
-def chunk_doc_id(file_id: str, idx: int) -> str:
-    return f"{file_id}_{idx}"
+def run_subprocess(cmd: List[str], timeout: int = 60):
+    try:
+        proc = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=timeout)
+        out = (proc.stdout or "") + (proc.stderr or "")
+        return True, out
+    except subprocess.CalledProcessError as e:
+        out = (e.stdout or "") + (e.stderr or "")
+        out += f"\nexit:{e.returncode}"
+        return False, out
+    except subprocess.TimeoutExpired as e:
+        out = (e.stdout or "") + (e.stderr or "")
+        out += f"\nTimeout after {timeout}s"
+        return False, out
+    except Exception as e:
+        return False, str(e)
 
-CHUNK_SIZE = 200_000  # characters per base64 chunk (safe for Firestore doc size)
+def system_is_headless() -> bool:
+    try:
+        if platform.system() in ("Linux", "Darwin"):
+            return os.environ.get("DISPLAY", "") == ""
+        elif platform.system() == "Windows":
+            session = os.environ.get("SESSIONNAME", "")
+            if not session or session.upper().startswith("SERVICE"):
+                return True
+            return False
+    except Exception:
+        return True
+    return False
 
-# Streamlit setup (minimal UI around upload/send)
-st.set_page_config(page_title="Autoprint (Firestore upgraded)", layout="wide", page_icon="🖨️")
-st.title("Autoprint — Firestore Sender (Upgraded)")
+def retry_with_backoff(func, attempts=3, initial_delay=0.5, factor=2.0, *args, **kwargs):
+    delay = initial_delay
+    last_exc = None
+    for i in range(attempts):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            last_exc = e
+            name = getattr(func, "__name__", str(func))
+            log(f"Attempt {i+1}/{attempts} failed for {name}: {e}", "warning")
+            logger.debug(traceback.format_exc())
+            time.sleep(delay)
+            delay *= factor
+    log(f"All {attempts} attempts failed for {getattr(func, '__name__', str(func))}", "error")
+    if last_exc:
+        raise last_exc
+    return None
 
-if 'converted_files_pm' not in st.session_state:
-    st.session_state.converted_files_pm = []
-if 'status' not in st.session_state:
-    st.session_state.status = ""
-if 'payinfo' not in st.session_state:
-    st.session_state.payinfo = None
-if 'process_complete' not in st.session_state:
-    st.session_state.process_complete = False
-if 'user_name' not in st.session_state:
-    st.session_state.user_name = ""
-if 'user_id' not in st.session_state:
-    st.session_state.user_id = str(uuid.uuid4())[:8]
-if 'pricing' not in st.session_state:
-    st.session_state.pricing = {
-        "price_bw_per_page": 2.00,
-        "price_color_per_page": 5.00,
-        "price_duplex_discount": 0.9,
-        "min_charge": 5.00,
-        "currency": "INR",
-        "owner_upi": "owner@upi"
-    }
+# --------- cleanup helpers ----------
+APP_TMP_PREFIXES = ("autoprint_sender_", "autoprint_", "docx_out_", "pptx_out_", "generic_out_")
+AUTO_CLEAN_AGE_HOURS = 72  # auto-clean files older than this at startup
 
-def set_status(s: str):
-    st.session_state.status = f"{datetime.datetime.now().strftime('%H:%M:%S')} - {s}"
-    log(st.session_state.status, "info")
+def cleanup_old_autoprint_temp(tmpdir=None, prefixes=APP_TMP_PREFIXES, age_hours=AUTO_CLEAN_AGE_HOURS, dry_run=True):
+    tmpdir = tmpdir or tempfile.gettempdir()
+    now = time.time()
+    inspected = []
+    actions = []
+    try:
+        for name in os.listdir(tmpdir):
+            for pref in prefixes:
+                if name.startswith(pref):
+                    path = os.path.join(tmpdir, name)
+                    try:
+                        st_mode = os.stat(path)
+                        age = (now - st_mode.st_mtime) / 3600.0
+                        inspected.append((path, round(age, 2)))
+                        if age >= age_hours:
+                            if dry_run:
+                                actions.append(("DRYRUN", path))
+                            else:
+                                try:
+                                    if os.path.isdir(path):
+                                        shutil.rmtree(path)
+                                    else:
+                                        os.remove(path)
+                                    actions.append(("REMOVED", path))
+                                except Exception as e:
+                                    actions.append(("ERR", path, str(e)))
+                    except Exception as e:
+                        actions.append(("STAT_ERR", path, str(e)))
+    except Exception as e:
+        logger.debug("cleanup_old_autoprint_temp failed:\n" + traceback.format_exc())
+    return {"inspected": inspected, "actions": actions}
 
-# Firestore init using st.secrets
+# perform a conservative auto-clean at startup (dry-run + actual for very old files)
+try:
+    debug_cleanup = cleanup_old_autoprint_temp(dry_run=True)
+    # automatically remove extremely old files (age >= 7 days) to avoid temp folder filling up
+    extreme_cleanup = cleanup_old_autoprint_temp(age_hours=24*7, dry_run=False)
+    log(f"Startup temp scan: inspected {len(debug_cleanup['inspected'])}, planned actions {len(debug_cleanup['actions'])}")
+    log(f"Startup extreme cleanup executed: actions {len(extreme_cleanup['actions'])}")
+except Exception:
+    logger.debug(traceback.format_exc())
+
+# --------- Firestore & constants ----------
 COLLECTION = "files"
+CHUNK_SIZE = 200_000  # characters per base64 chunk (safe for Firestore)
 db = None
 FIRESTORE_OK = False
 FIRESTORE_ERR = None
@@ -124,38 +294,57 @@ def init_firestore_from_secrets():
             firebase_admin.initialize_app(cred)
         db = firestore.client()
         FIRESTORE_OK = True
-        set_status("Firestore initialized")
+        st.session_state.status = "Firestore initialized"
         log("Firestore initialized", "info")
     except Exception as e:
         FIRESTORE_OK = False
         db = None
         FIRESTORE_ERR = str(e)
-        set_status(f"Firestore init failed: {e}")
+        st.session_state.status = f"Firestore init failed: {e}"
         log(f"Firestore init failed: {e}", "error")
         logger.debug(traceback.format_exc())
 
+# Try to init Firestore (will set FIRESTORE_OK appropriately)
 init_firestore_from_secrets()
-if not FIRESTORE_OK:
-    st.warning("Firestore not initialized. Add 'firebase_service_account' to Streamlit Secrets.")
 
-# retry helper (simple)
-def retry_with_backoff_simple(func, attempts=3, initial_delay=0.5, factor=2.0):
-    delay = initial_delay
-    last_exc = None
-    for i in range(attempts):
-        try:
-            return func()
-        except Exception as e:
-            last_exc = e
-            log(f"Attempt {i+1}/{attempts} failed: {e}", "warning")
-            logger.debug(traceback.format_exc())
-            time.sleep(delay)
-            delay *= factor
-    if last_exc:
-        raise last_exc
-    return None
+# session state init
+if 'converted_files_pm' not in st.session_state:
+    st.session_state.converted_files_pm = []
+if 'payinfo' not in st.session_state:
+    st.session_state.payinfo = None
+if 'status' not in st.session_state:
+    st.session_state.status = ""
+if 'process_complete' not in st.session_state:
+    st.session_state.process_complete = False
+if 'user_name' not in st.session_state:
+    st.session_state.user_name = ""
+if 'user_id' not in st.session_state:
+    st.session_state.user_id = str(uuid.uuid4())[:8]
+if 'pricing' not in st.session_state:
+    st.session_state.pricing = {
+        "price_bw_per_page": 2.00,
+        "price_color_per_page": 5.00,
+        "price_duplex_discount": 0.9,
+        "min_charge": 5.00,
+        "currency": "INR",
+        "owner_upi": "owner@upi"
+    }
 
-# price calc (same as before)
+def set_status(s: str):
+    st.session_state.status = f"{datetime.datetime.now().strftime('%H:%M:%S')} - {s}"
+    log(st.session_state.status, "info")
+
+# helpers
+def sha256_bytes(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+def meta_doc_id(file_id: str) -> str:
+    return f"{file_id}_meta"
+
+def chunk_doc_id(file_id: str, idx: int) -> str:
+    return f"{file_id}_{idx}"
+
+# price helpers
 def calculate_amount(cfg, pages, copies=1, color=False, duplex=False):
     try:
         price_per_page = cfg.get("price_color_per_page") if color else cfg.get("price_bw_per_page")
@@ -174,7 +363,7 @@ def generate_upi_uri(upi_id, amount, note=None):
         params.append(f"tn={note}")
     return "upi://pay?" + "&".join(params)
 
-# send_multiple_files: upgraded polling logic (query by job_id)
+# send_multiple_files with robust job_id polling (uses Firestore)
 def send_multiple_files(converted_files: List[ConvertedFile], copies: int, color_mode: str):
     global db, FIRESTORE_OK
     if not FIRESTORE_OK or db is None:
@@ -232,7 +421,7 @@ def send_multiple_files(converted_files: List[ConvertedFile], copies: int, color
                 doc_ref = db.collection(COLLECTION).document(chunk_doc_id(fid, idx))
                 def _write_chunk(dref=doc_ref, data_piece=piece, i=idx):
                     dref.set({"data": data_piece, "chunk_index": i})
-                retry_with_backoff_simple(_write_chunk, attempts=3)
+                retry_with_backoff(_write_chunk, attempts=3)
                 uploaded_chunks += 1
                 try:
                     progress_bar.progress(min(1.0, uploaded_chunks / max(1, total_chunks_all)))
@@ -259,7 +448,7 @@ def send_multiple_files(converted_files: List[ConvertedFile], copies: int, color
             }
             def _write_meta(mref=db.collection(COLLECTION).document(meta_doc_id(fid)), data=meta_doc):
                 mref.set(data, merge=True)
-            retry_with_backoff_simple(_write_meta, attempts=3)
+            retry_with_backoff(_write_meta, attempts=3)
             set_status(f"Wrote manifest for {m['filename']} (id={fid})")
 
         # Poll for payinfo — query manifests by job_id (more robust)
@@ -273,24 +462,19 @@ def send_multiple_files(converted_files: List[ConvertedFile], copies: int, color
         # helper: check payinfo by job_id
         def _check_payinfo_by_job():
             try:
-                # Query any manifest doc with this job_id and a non-empty payinfo field
-                q = db.collection(COLLECTION).where("job_id", "==", job_id).limit(20)
+                q = db.collection(COLLECTION).where("job_id", "==", job_id).limit(50)
                 snaps = q.get()
                 for s in snaps:
                     try:
                         md = s.to_dict() or {}
-                        # if receiver writes payinfo under 'payinfo' key
-                        if md.get("payinfo"):
-                            return md.get("payinfo")
-                        # some receivers might write 'payment' or 'payment_info' - try some tolerant checks
-                        if md.get("payment"):
-                            return md.get("payment")
-                        if md.get("payment_info"):
-                            return md.get("payment_info")
+                        # tolerant keys
+                        for key in ("payinfo","payment","payment_info","paymentInfo"):
+                            if md.get(key):
+                                return md.get(key)
                     except Exception:
                         logger.debug(traceback.format_exc())
                         continue
-            except Exception as e:
+            except Exception:
                 logger.debug("Error querying payinfo by job_id:\n" + traceback.format_exc())
             return None
 
@@ -301,7 +485,6 @@ def send_multiple_files(converted_files: List[ConvertedFile], copies: int, color
                 set_status("Received payment info from receiver.")
                 break
 
-            # show local estimate after short_wait
             if not local_estimate_shown and (time.time() - poll_start) >= short_wait:
                 cfg = st.session_state.get("pricing") or {}
                 total_amount = 0.0
@@ -333,7 +516,6 @@ def send_multiple_files(converted_files: List[ConvertedFile], copies: int, color
 
         if not st.session_state.payinfo:
             set_status("No payinfo received; showing local estimate if available.")
-            # if local_estimate_shown remains False, compute a final estimate now
             if not local_estimate_shown:
                 cfg = st.session_state.get("pricing") or {}
                 total_amount = 0.0
@@ -369,7 +551,7 @@ def send_multiple_files(converted_files: List[ConvertedFile], copies: int, color
         set_status("Upload failed")
         return
 
-# payment helpers (unchanged-ish)
+# payment flows
 def pay_offline():
     payinfo = st.session_state.get("payinfo") or {}
     amount = payinfo.get("amount", 0)
@@ -382,15 +564,26 @@ def pay_offline():
 def pay_online():
     payinfo = st.session_state.get("payinfo") or {}
     owner_upi = payinfo.get("owner_upi")
+    amount = payinfo.get("amount", 0)
+    file_name = payinfo.get("file_name", "Print Job")
+    # prefer owner_upi from payinfo else pricing
+    if not owner_upi:
+        owner_upi = st.session_state.get("pricing", {}).get("owner_upi")
     if not owner_upi:
         st.error("Payment information not available")
         return
-    amount = payinfo.get("amount", 0)
-    file_name = payinfo.get("file_name", "Print Job")
     upi_uri = generate_upi_uri(owner_upi, amount, note=f"Print: {file_name}")
     st.markdown(f"**💳 Pay ₹{amount} via UPI**")
     st.markdown(f"[🚀 **Open Payment App**]({upi_uri})")
-    # Avoid server-side webbrowser.open here (not reliable on hosted servers)
+    if QR_AVAILABLE:
+        try:
+            qr = qrcode.QRCode(box_size=6, border=2)
+            qr.add_data(upi_uri)
+            qr.make(fit=True)
+            img = qr.make_image(fill_color="black", back_color="white")
+            st.image(img, width=200, caption="Scan with any UPI app")
+        except Exception:
+            pass
     st.info("Complete the payment in your payment app.")
     st.balloons()
     st.session_state.payinfo = None
@@ -400,14 +593,72 @@ def cancel_payment():
     st.session_state.payinfo = None
     set_status("Cancelled by user")
 
-# Minimal UI for file upload and send
-st.subheader("Upload files (conversion is handled by the module you provided)")
+# --------- Streamlit UI ----------
+st.set_page_config(page_title="Autoprint (Upgraded)", layout="wide")
+st.markdown("<h1 style='text-align:center;margin:6px 0 8px 0;'>Autoprint — Firestore Sender (Upgraded)</h1>", unsafe_allow_html=True)
+
+# sidebar diagnostics & environment
+with st.sidebar.expander("Environment & Diagnostics"):
+    st.write(f"Platform: {platform.system()}")
+    st.write("Using user conversion module:", USING_USER_MODULE)
+    st.write("LibreOffice on PATH:", bool(find_executable(["soffice", "libreoffice"])))
+    st.write("Log file:", LOGFILE)
+    if st.button("Show log tail"):
+        try:
+            with open(LOGFILE, "r", encoding="utf-8") as lf:
+                st.code(lf.read()[-4000:])
+        except Exception as e:
+            st.error(f"Could not read log file: {e}")
+
+    if st.button("Run quick env diagnostic"):
+        import shutil, importlib, sys
+        diag = {}
+        for exe in ("soffice","libreoffice","pandoc","pdflatex"):
+            diag[exe] = shutil.which(exe)
+        pkgs = ["python-docx","docx2pdf","python-pptx","pypandoc","PyPDF2","fpdf","qrcode"]
+        pkg_info = {}
+        for p in pkgs:
+            try:
+                m = importlib.import_module(p.replace("-", "_"))
+                pkg_info[p] = getattr(m, "__version__", "ok")
+            except Exception as e:
+                pkg_info[p] = f"missing ({e})"
+        st.write("Executables:", diag)
+        st.write("Python packages:", pkg_info)
+
+    if st.button("Show /tmp space (quick)"):
+        try:
+            out = subprocess.check_output(["df", "-h", tempfile.gettempdir()]).decode()
+            st.code(out)
+            out2 = subprocess.check_output("du -sh {}/* 2>/dev/null | sort -rh | head -n 20".format(tempfile.gettempdir()), shell=True).decode()
+            st.code(out2)
+        except Exception as e:
+            st.error(f"Diagnostic failed: {e}")
+
+    # cleanup controls
+    st.markdown("### Temp cleanup")
+    if st.button("Dry-run cleanup (show app temp files)"):
+        res = cleanup_old_autoprint_temp(dry_run=True)
+        st.write("Inspected:", len(res["inspected"]))
+        st.write("Some actions (dryrun):", res["actions"][:40])
+    if st.button("Run cleanup (remove old app temp files)"):
+        res = cleanup_old_autoprint_temp(dry_run=False)
+        st.write("Removed / errors:", res["actions"][:40])
+
+# main UI: user + upload
+st.markdown("## 👤 User")
+user_name = st.text_input("Your name (optional)", value=st.session_state.get("user_name", ""))
+if user_name != st.session_state.get("user_name", ""):
+    st.session_state.user_name = user_name
+st.caption(f"Your ID: {st.session_state['user_id']}")
+
+st.markdown("## 📄 Upload & Queue")
 uploaded = st.file_uploader("Upload files (multiple)", accept_multiple_files=True,
                             type=['pdf','txt','md','rtf','html','htm','png','jpg','jpeg','bmp','tiff','webp','docx','pptx'],
-                            key="pm_multi_upload_upgraded")
+                            key="pm_multi_upload_full")
 
 if uploaded:
-    with st.spinner("Converting..."):
+    with st.spinner("Converting uploads..."):
         conv_list = st.session_state.get("converted_files_pm", [])
         added = 0
         for uf in uploaded:
@@ -415,10 +666,11 @@ if uploaded:
                 continue
             try:
                 original_bytes = uf.getvalue()
-                if FileConverter:
+                pdf_bytes = None
+                try:
                     pdf_bytes = FileConverter.convert_uploaded_file_to_pdf_bytes(uf)
-                else:
-                    pdf_bytes = None
+                except Exception:
+                    logger.debug(traceback.format_exc())
                 if pdf_bytes:
                     cf = ConvertedFile(orig_name=uf.name,
                                        pdf_name=os.path.splitext(uf.name)[0] + ".pdf",
@@ -431,7 +683,7 @@ if uploaded:
                                        pdf_bytes=b"",
                                        settings=PrintSettings(),
                                        original_bytes=original_bytes)
-                    st.warning(f"Conversion to PDF unavailable for {uf.name}. Will send original bytes as fallback.")
+                    st.warning(f"Conversion to PDF unavailable for {uf.name} — will send original bytes as fallback.")
                 conv_list.append(cf)
                 added += 1
             except Exception as e:
@@ -440,40 +692,106 @@ if uploaded:
         if added:
             st.success(f"Added {added} file(s).")
 
-st.write("Files queued:")
+# show queue
+st.markdown("### 📂 Files in queue")
 conv = st.session_state.get("converted_files_pm", [])
-for idx, cf in enumerate(conv):
-    cols = st.columns([4,1,1,1])
-    cols[0].write(f"{cf.pdf_name} (orig: {cf.orig_name})")
-    cols[1].write(f"{count_pdf_pages(cf.pdf_bytes if cf.pdf_bytes else (cf.original_bytes or b''))}p")
-    if cols[2].button("Remove", key=f"rm_upgraded_{idx}"):
-        st.session_state.converted_files_pm = [x for i,x in enumerate(conv) if i != idx]
-        set_status(f"Removed {cf.orig_name}")
+if not conv:
+    st.info("No files queued.")
+else:
+    for idx, cf in enumerate(conv):
+        cols = st.columns([4,1,1,1])
+        with cols[0]:
+            selkey = f"sel_file_{idx}"
+            if selkey not in st.session_state:
+                st.session_state[selkey] = True
+            st.checkbox(f"{cf.pdf_name} (orig: {cf.orig_name})", value=st.session_state[selkey], key=selkey)
+            if st.button(f"Preview {idx}", key=f"preview_full_{idx}"):
+                blob = cf.pdf_bytes if cf.pdf_bytes else (cf.original_bytes or b"")
+                if blob:
+                    b64 = base64.b64encode(blob).decode('utf-8')
+                    ts = int(time.time()*1000)
+                    js = f"""
+                    <script>
+                    (function(){{
+                        const b64="{b64}";
+                        const bytes=atob(b64);const arr=new Uint8Array(bytes.length);
+                        for(let i=0;i<bytes.length;i++)arr[i]=bytes.charCodeAt(i);
+                        const blob=new Blob([arr],{{type:'application/pdf'}});
+                        const url=URL.createObjectURL(blob);
+                        const w=window.open(url,'preview_{ts}','width=900,height=700');
+                        if(!w)alert('Allow popups to preview.');
+                    }})();
+                    </script>
+                    """
+                    components.html(js, height=0)
+                else:
+                    st.warning("No preview available (no PDF bytes).")
+        with cols[1]:
+            if cf.pdf_bytes:
+                st.download_button("Download PDF", data=cf.pdf_bytes, file_name=cf.pdf_name, mime="application/pdf", key=f"dlpdf_{idx}")
+            else:
+                st.download_button("Download original", data=cf.original_bytes or b"", file_name=cf.orig_name, mime="application/octet-stream", key=f"dlorig_{idx}")
+        with cols[2]:
+            if st.button("Remove", key=f"rm_full_{idx}"):
+                st.session_state.converted_files_pm = [x for x in st.session_state.converted_files_pm if x.orig_name != cf.orig_name]
+                set_status(f"Removed {cf.orig_name}")
+        with cols[3]:
+            blob_for_count = cf.pdf_bytes if cf.pdf_bytes else (cf.original_bytes or b'')
+            pages = count_pdf_pages(blob_for_count)
+            st.caption(f"{pages}p")
 
-if conv:
-    copies = st.number_input("Copies per file", min_value=1, max_value=10, value=1, key="upg_copies")
-    color_mode = st.selectbox("Color mode", options=["Auto", "Color", "Monochrome"], key="upg_colormode")
-    if st.button("Send Selected Files (Firestore)", key="upg_send"):
-        # send all queued files for brevity
-        send_multiple_files(conv, copies, color_mode)
+# job settings + send
+selected_files = [cf for i,cf in enumerate(conv) if st.session_state.get(f"sel_file_{i}", True)]
+st.markdown("---")
+st.markdown("### 🖨️ Job Settings")
+col1, col2 = st.columns(2)
+with col1:
+    copies = st.number_input("Copies per file", min_value=1, max_value=10, value=1, key="full_copies")
+with col2:
+    color_mode = st.selectbox("Color mode", options=["Auto", "Color", "Monochrome"], key="full_colormode")
 
+if st.button("📤 Send Selected Files (Firestore)", key="full_send"):
+    if not selected_files:
+        st.error("No files selected.")
+    else:
+        # perform send in thread to avoid blocking UI (conversion is already done)
+        import threading
+        thr = threading.Thread(target=send_multiple_files, args=(selected_files, copies, color_mode), daemon=True)
+        thr.start()
+        st.info("Upload started in background. Watch status and Payment section.")
+
+# status & payment view
 if st.session_state.get("status"):
-    st.info(f"Status: {st.session_state['status']}")
+    st.info(f"📊 Status: {st.session_state['status']}")
 
-if st.session_state.get("payinfo") and not st.session_state.get("process_complete"):
+payinfo = st.session_state.get("payinfo")
+if payinfo and not st.session_state.get("process_complete"):
     st.markdown("---")
-    st.markdown("### Payment")
-    st.write(st.session_state.get("payinfo"))
-    if st.button("Pay Online (Open UPI link)"):
-        pay_online()
-    if st.button("Mark Paid Offline"):
-        pay_offline()
+    st.markdown("## 💳 Payment")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.write(f"**File(s):** {payinfo.get('file_name', payinfo.get('filename', 'Multiple'))}")
+        st.write(f"**Amount:** ₹{payinfo.get('amount', 0)} {payinfo.get('currency', 'INR')}")
+        st.write(f"**Pages:** {payinfo.get('pages', 'N/A')}")
+    with c2:
+        st.write(f"**Copies:** {payinfo.get('copies', 1)}")
+        if payinfo.get("estimated"):
+            st.warning("This is a local estimate while waiting for official payinfo from receiver.")
+            if st.button("Use estimated payment now"):
+                pay_online()
+        else:
+            if st.button("Pay Online"):
+                pay_online()
+            if st.button("Pay Offline"):
+                pay_offline()
 
 if st.session_state.get("process_complete"):
-    st.success("Process complete.")
-    if st.button("Start new"):
+    st.success("🎉 Process Complete!")
+    if st.button("Start New Transfer"):
         st.session_state.process_complete = False
         st.session_state.payinfo = None
         st.session_state.status = ""
         st.session_state.user_id = str(uuid.uuid4())[:8]
         set_status("Ready")
+
+st.markdown("<div style='text-align:center;color:#666;padding-top:6px;'>Autoprint — Upgraded sender (cleanup + robust payinfo polling)</div>", unsafe_allow_html=True)
