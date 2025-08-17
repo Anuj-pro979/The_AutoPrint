@@ -13,3 +13,10 @@ firebase-admin
 python-docx
 python-pptx
 pypdfium2   # optional: useful if you need alternate PDF tools
+
+weasyprint 
+reportlab 
+mammoth
+fonttools 
+pillow
+
