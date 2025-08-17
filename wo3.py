@@ -1,4 +1,3 @@
-analyze the following code step by step 
 
 # wo3_autoprint_streamlit_firestore_sender_complete_fixed_docx.py
 # Streamlit sender that uploads chunked base64 docs + manifest to Firestore
@@ -1073,3 +1072,4 @@ else:
                 st.success("Added to print queue.")
 
 st.markdown("<div style='text-align:center;color:#666;padding-top:6px;'>Autoprint — Firestore chunked upload sender (docx fallback improved)</div>", unsafe_allow_html=True)
+
