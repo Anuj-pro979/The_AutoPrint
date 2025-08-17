@@ -1,8 +1,8 @@
-# wo3_autoprint_streamlit_firestore_sender_enhanced.py
-# High-Quality Cloud-compatible Streamlit sender with advanced PDF conversion
-# Enhanced with multiple conversion libraries for maximum quality
+# wo3_autoprint_streamlit_firestore_sender_cloud_compatible.py
+# Cloud-compatible Streamlit sender with high-quality PDF conversion
+# Optimized for Streamlit Cloud without problematic system dependencies
 #
-# Run: streamlit run wo3_autoprint_streamlit_firestore_sender_enhanced.py
+# Run: streamlit run wo3_autoprint_streamlit_firestore_sender_cloud_compatible.py
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -26,8 +26,10 @@ import webbrowser
 import io
 import zipfile
 import xml.etree.ElementTree as ET
+import re
+import html
 
-# Enhanced PDF libraries
+# Enhanced PDF libraries (cloud-compatible)
 try:
     from reportlab.pdfgen import canvas
     from reportlab.lib.pagesizes import letter, A4
@@ -38,21 +40,33 @@ try:
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as RLImage, Table, TableStyle
     from reportlab.lib import colors
     from reportlab.lib.units import inch
+    from reportlab.lib.enums import TA_JUSTIFY, TA_LEFT, TA_CENTER
     REPORTLAB_AVAILABLE = True
 except ImportError:
     REPORTLAB_AVAILABLE = False
 
-try:
-    import weasyprint
-    WEASYPRINT_AVAILABLE = True
-except ImportError:
-    WEASYPRINT_AVAILABLE = False
+# Skip WeasyPrint due to system dependency issues on cloud platforms
+WEASYPRINT_AVAILABLE = False
 
 try:
     import mammoth
     MAMMOTH_AVAILABLE = True
 except ImportError:
     MAMMOTH_AVAILABLE = False
+
+# Enhanced Markdown processing
+try:
+    import markdown
+    MARKDOWN_AVAILABLE = True
+except ImportError:
+    MARKDOWN_AVAILABLE = False
+
+# HTML to text conversion
+try:
+    from bs4 import BeautifulSoup
+    BS4_AVAILABLE = True
+except ImportError:
+    BS4_AVAILABLE = False
 
 # Fallback to original libraries
 from fpdf import FPDF
@@ -68,7 +82,7 @@ except ImportError:
     firestore = None
     FIRESTORE_AVAILABLE = False
 
-# PDF processing - use modern pypdf instead of deprecated PyPDF2
+# PDF processing
 try:
     from pypdf import PdfReader
     PDF_READER_AVAILABLE = True
@@ -150,7 +164,7 @@ def retry_with_backoff(func, attempts=3, initial_delay=0.5, factor=2.0, *args, *
             last_exc = e
             func_name = getattr(func, "__name__", str(func))
             logger.warning(f"Attempt {i+1}/{attempts} failed for {func_name}: {e}")
-            if i < attempts - 1:  # Don't sleep on last attempt
+            if i < attempts - 1:
                 time.sleep(delay)
                 delay *= factor
     
@@ -182,140 +196,145 @@ class ConvertedFile:
     conversion_method: str = "unknown"
     pages: int = 1
 
-# --------- Enhanced FileConverter ----------
-class EnhancedFileConverter:
-    """Enhanced file converter with multiple high-quality conversion methods"""
+# --------- Cloud-Compatible Enhanced FileConverter ----------
+class CloudCompatibleFileConverter:
+    """Cloud-compatible file converter with high-quality conversion methods"""
     
     SUPPORTED_TEXT_EXTENSIONS = {'.txt', '.md', '.rtf', '.html', '.htm', '.csv', '.log', '.xml', '.json'}
     SUPPORTED_IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif', '.webp', '.gif'}
     
     @staticmethod
-    def create_html_template(title: str, content: str) -> str:
-        """Create HTML template for high-quality PDF conversion"""
-        return f"""
-        <!DOCTYPE html>
-        <html lang="en">
-        <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>{title}</title>
-            <style>
-                @page {{
-                    size: A4;
-                    margin: 2cm;
-                }}
-                body {{
-                    font-family: 'Arial', 'Liberation Sans', sans-serif;
-                    line-height: 1.6;
-                    color: #333;
-                    max-width: 100%;
-                    margin: 0;
-                    padding: 0;
-                }}
-                h1 {{
-                    color: #2c3e50;
-                    border-bottom: 2px solid #3498db;
-                    padding-bottom: 10px;
-                    margin-bottom: 20px;
-                }}
-                h2, h3 {{
-                    color: #34495e;
-                }}
-                p {{
-                    margin-bottom: 12px;
-                    text-align: justify;
-                }}
-                pre {{
-                    background-color: #f8f9fa;
-                    border: 1px solid #e9ecef;
-                    border-radius: 4px;
-                    padding: 12px;
-                    overflow-x: auto;
-                    font-family: 'Courier New', monospace;
-                }}
-                table {{
-                    border-collapse: collapse;
-                    width: 100%;
-                    margin-bottom: 20px;
-                }}
-                th, td {{
-                    border: 1px solid #ddd;
-                    padding: 8px;
-                    text-align: left;
-                }}
-                th {{
-                    background-color: #f2f2f2;
-                }}
-                .header {{
-                    text-align: center;
-                    margin-bottom: 30px;
-                }}
-                .content {{
-                    white-space: pre-wrap;
-                    word-wrap: break-word;
-                }}
-            </style>
-        </head>
-        <body>
-            <div class="header">
-                <h1>{title}</h1>
-            </div>
-            <div class="content">
-                {content}
-            </div>
-        </body>
-        </html>
-        """
-    
-    @classmethod
-    def create_text_pdf_weasyprint(cls, text: str, title: str = "Document") -> Optional[bytes]:
-        """Create high-quality PDF from text using WeasyPrint"""
+    def html_to_text(html_content: str) -> str:
+        """Convert HTML to formatted text"""
         try:
-            if not WEASYPRINT_AVAILABLE:
-                return None
-            
-            # Process text for HTML
-            html_content = text.replace('\n', '<br>\n').replace('\t', '&nbsp;&nbsp;&nbsp;&nbsp;')
-            html = cls.create_html_template(title, html_content)
-            
-            # Convert HTML to PDF using WeasyPrint
-            pdf_bytes = weasyprint.HTML(string=html).write_pdf()
-            return pdf_bytes
-            
+            if BS4_AVAILABLE:
+                soup = BeautifulSoup(html_content, 'html.parser')
+                
+                # Handle different HTML elements
+                for elem in soup.find_all(['script', 'style']):
+                    elem.decompose()
+                
+                # Convert headers
+                for i in range(1, 7):
+                    for header in soup.find_all(f'h{i}'):
+                        header.insert_before('\n\n')
+                        header.insert_after('\n\n')
+                        header.string = f"{'#' * i} {header.get_text()}"
+                
+                # Convert paragraphs
+                for p in soup.find_all('p'):
+                    p.insert_after('\n\n')
+                
+                # Convert line breaks
+                for br in soup.find_all('br'):
+                    br.replace_with('\n')
+                
+                # Convert lists
+                for li in soup.find_all('li'):
+                    li.insert_before('• ')
+                    li.insert_after('\n')
+                
+                return soup.get_text()
+            else:
+                # Basic HTML cleaning without BeautifulSoup
+                text = re.sub(r'<script[^>]*>.*?</script>', '', html_content, flags=re.DOTALL | re.IGNORECASE)
+                text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL | re.IGNORECASE)
+                text = re.sub(r'<h[1-6][^>]*>(.*?)</h[1-6]>', r'\n\n# \1\n\n', text)
+                text = re.sub(r'<p[^>]*>(.*?)</p>', r'\1\n\n', text)
+                text = re.sub(r'<br[^>]*/?>', '\n', text)
+                text = re.sub(r'<li[^>]*>(.*?)</li>', r'• \1\n', text)
+                text = re.sub(r'<[^>]+>', '', text)
+                text = html.unescape(text)
+                return re.sub(r'\n\s*\n', '\n\n', text).strip()
         except Exception as e:
-            logger.error(f"WeasyPrint conversion failed: {e}")
-            return None
+            logger.error(f"HTML to text conversion failed: {e}")
+            return html_content
     
     @classmethod
-    def create_text_pdf_reportlab(cls, text: str, title: str = "Document") -> Optional[bytes]:
-        """Create high-quality PDF from text using ReportLab"""
+    def create_text_pdf_reportlab_enhanced(cls, text: str, title: str = "Document") -> Optional[bytes]:
+        """Create high-quality PDF from text using enhanced ReportLab"""
         try:
             if not REPORTLAB_AVAILABLE:
                 return None
             
             buffer = io.BytesIO()
-            doc = SimpleDocTemplate(buffer, pagesize=A4, 
-                                  rightMargin=72, leftMargin=72,
-                                  topMargin=72, bottomMargin=18)
-            
-            # Get styles
-            styles = getSampleStyleSheet()
-            title_style = ParagraphStyle(
-                'CustomTitle',
-                parent=styles['Heading1'],
-                fontSize=16,
-                spaceAfter=30,
-                textColor=colors.darkblue,
-                alignment=1  # Center alignment
+            doc = SimpleDocTemplate(
+                buffer, 
+                pagesize=A4, 
+                rightMargin=72, 
+                leftMargin=72,
+                topMargin=72, 
+                bottomMargin=72
             )
             
-            normal_style = ParagraphStyle(
-                'CustomNormal',
-                parent=styles['Normal'],
-                fontSize=11,
+            # Enhanced styles
+            styles = getSampleStyleSheet()
+            
+            # Custom title style
+            title_style = ParagraphStyle(
+                'EnhancedTitle',
+                parent=styles['Heading1'],
+                fontSize=18,
+                spaceAfter=30,
+                spaceBefore=20,
+                textColor=colors.darkblue,
+                alignment=TA_CENTER,
+                fontName='Helvetica-Bold'
+            )
+            
+            # Custom header styles
+            header1_style = ParagraphStyle(
+                'EnhancedHeader1',
+                parent=styles['Heading1'],
+                fontSize=14,
                 spaceAfter=12,
+                spaceBefore=20,
+                textColor=colors.darkslategray,
+                fontName='Helvetica-Bold'
+            )
+            
+            header2_style = ParagraphStyle(
+                'EnhancedHeader2',
+                parent=styles['Heading2'],
+                fontSize=12,
+                spaceAfter=8,
+                spaceBefore=16,
+                textColor=colors.darkslategray,
+                fontName='Helvetica-Bold'
+            )
+            
+            # Enhanced normal style
+            normal_style = ParagraphStyle(
+                'EnhancedNormal',
+                parent=styles['Normal'],
+                fontSize=10,
+                spaceAfter=6,
                 textColor=colors.black,
-                fontName='Helvetica'
+                fontName='Helvetica',
+                alignment=TA_JUSTIFY,
+                leading=12
+            )
+            
+            # Code/monospace style
+            code_style = ParagraphStyle(
+                'EnhancedCode',
+                parent=styles['Normal'],
+                fontSize=9,
+                spaceAfter=6,
+                textColor=colors.darkgreen,
+                fontName='Courier',
+                backColor=colors.lightgrey,
+                borderColor=colors.grey,
+                borderWidth=0.5,
+                borderPadding=6
+            )
+            
+            # List style
+            list_style = ParagraphStyle(
+                'EnhancedList',
+                parent=normal_style,
+                leftIndent=20,
+                bulletIndent=10
             )
             
             # Build document
@@ -323,17 +342,88 @@ class EnhancedFileConverter:
             
             # Add title
             story.append(Paragraph(title, title_style))
-            story.append(Spacer(1, 12))
+            story.append(Spacer(1, 20))
             
-            # Add content paragraphs
-            paragraphs = text.split('\n\n')
-            for para in paragraphs:
-                if para.strip():
-                    # Escape HTML characters and handle line breaks
-                    para = para.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-                    para = para.replace('\n', '<br/>')
-                    story.append(Paragraph(para, normal_style))
-                    story.append(Spacer(1, 6))
+            # Process content
+            lines = text.split('\n')
+            current_paragraph = []
+            in_code_block = False
+            
+            for line in lines:
+                line = line.rstrip()
+                
+                # Handle code blocks
+                if line.startswith('```') or line.startswith('~~~'):
+                    if current_paragraph:
+                        para_text = ' '.join(current_paragraph)
+                        if para_text.strip():
+                            story.append(Paragraph(para_text, normal_style))
+                        current_paragraph = []
+                    
+                    in_code_block = not in_code_block
+                    continue
+                
+                if in_code_block:
+                    if line.strip():
+                        story.append(Paragraph(line, code_style))
+                    else:
+                        story.append(Spacer(1, 6))
+                    continue
+                
+                # Handle headers
+                if line.startswith('# '):
+                    if current_paragraph:
+                        para_text = ' '.join(current_paragraph)
+                        if para_text.strip():
+                            story.append(Paragraph(para_text, normal_style))
+                        current_paragraph = []
+                    
+                    header_text = line[2:].strip()
+                    story.append(Paragraph(header_text, header1_style))
+                    continue
+                
+                elif line.startswith('## '):
+                    if current_paragraph:
+                        para_text = ' '.join(current_paragraph)
+                        if para_text.strip():
+                            story.append(Paragraph(para_text, normal_style))
+                        current_paragraph = []
+                    
+                    header_text = line[3:].strip()
+                    story.append(Paragraph(header_text, header2_style))
+                    continue
+                
+                # Handle lists
+                elif line.startswith('• ') or line.startswith('- ') or line.startswith('* '):
+                    if current_paragraph:
+                        para_text = ' '.join(current_paragraph)
+                        if para_text.strip():
+                            story.append(Paragraph(para_text, normal_style))
+                        current_paragraph = []
+                    
+                    list_text = line[2:].strip()
+                    story.append(Paragraph(f"• {list_text}", list_style))
+                    continue
+                
+                # Handle empty lines
+                elif not line.strip():
+                    if current_paragraph:
+                        para_text = ' '.join(current_paragraph)
+                        if para_text.strip():
+                            story.append(Paragraph(para_text, normal_style))
+                        current_paragraph = []
+                        story.append(Spacer(1, 6))
+                    continue
+                
+                # Regular text
+                else:
+                    current_paragraph.append(line)
+            
+            # Don't forget the last paragraph
+            if current_paragraph:
+                para_text = ' '.join(current_paragraph)
+                if para_text.strip():
+                    story.append(Paragraph(para_text, normal_style))
             
             # Build PDF
             doc.build(story)
@@ -341,58 +431,61 @@ class EnhancedFileConverter:
             return buffer.getvalue()
             
         except Exception as e:
-            logger.error(f"ReportLab conversion failed: {e}")
+            logger.error(f"Enhanced ReportLab conversion failed: {e}")
             return None
     
     @classmethod
     def create_text_pdf_enhanced_fpdf(cls, text: str, title: str = "Document") -> bytes:
-        """Enhanced FPDF with better Unicode support and formatting"""
+        """Enhanced FPDF with better formatting and Unicode support"""
         try:
             pdf = FPDF(unit='mm', format='A4')
             pdf.set_auto_page_break(auto=True, margin=15)
             pdf.add_page()
             
-            # Set UTF-8 font (DejaVu Sans supports more characters)
-            try:
-                pdf.add_font('DejaVu', '', 'DejaVuSansCondensed.ttf', uni=True)
-                pdf.set_font('DejaVu', size=11)
-            except:
-                pdf.set_font('Arial', size=11)
-            
-            # Add title
+            # Title
             pdf.set_font('Arial', 'B', 16)
-            pdf.cell(0, 10, title.encode('latin-1', 'replace').decode('latin-1'), ln=True, align='C')
-            pdf.ln(5)
+            title_encoded = title.encode('latin-1', 'replace').decode('latin-1')
+            pdf.cell(0, 10, title_encoded, ln=True, align='C')
+            pdf.ln(10)
             
-            # Add content with better formatting
-            pdf.set_font('Arial', size=11)
-            
-            # Split text into paragraphs
-            paragraphs = text.split('\n\n')
-            
-            for paragraph in paragraphs:
-                if not paragraph.strip():
+            # Process content
+            lines = text.split('\n')
+            for line in lines:
+                line = line.strip()
+                if not line:
                     pdf.ln(3)
                     continue
                 
-                # Handle different types of content
-                if paragraph.startswith('#'):
-                    # Headers
+                # Headers
+                if line.startswith('# '):
                     pdf.set_font('Arial', 'B', 14)
-                    header = paragraph.lstrip('#').strip()
-                    pdf.multi_cell(0, 7, header.encode('utf-8', 'replace').decode('utf-8', 'replace'))
-                    pdf.set_font('Arial', size=11)
-                elif paragraph.strip().startswith('-') or paragraph.strip().startswith('*'):
-                    # Lists
-                    lines = paragraph.split('\n')
-                    for line in lines:
-                        if line.strip():
-                            pdf.multi_cell(0, 5, ("  • " + line.strip().lstrip('-*').strip()).encode('utf-8', 'replace').decode('utf-8', 'replace'))
-                else:
-                    # Regular paragraphs
-                    pdf.multi_cell(0, 5, paragraph.encode('utf-8', 'replace').decode('utf-8', 'replace'))
+                    header = line[2:].strip()
+                    header_encoded = header.encode('utf-8', 'replace').decode('utf-8', 'replace')
+                    pdf.multi_cell(0, 7, header_encoded)
+                    pdf.ln(3)
+                    pdf.set_font('Arial', size=10)
                 
-                pdf.ln(3)
+                elif line.startswith('## '):
+                    pdf.set_font('Arial', 'B', 12)
+                    header = line[3:].strip()
+                    header_encoded = header.encode('utf-8', 'replace').decode('utf-8', 'replace')
+                    pdf.multi_cell(0, 6, header_encoded)
+                    pdf.ln(2)
+                    pdf.set_font('Arial', size=10)
+                
+                # Lists
+                elif line.startswith(('• ', '- ', '* ')):
+                    pdf.set_font('Arial', size=10)
+                    list_text = "  • " + line[2:].strip()
+                    list_encoded = list_text.encode('utf-8', 'replace').decode('utf-8', 'replace')
+                    pdf.multi_cell(0, 5, list_encoded)
+                
+                # Regular text
+                else:
+                    pdf.set_font('Arial', size=10)
+                    text_encoded = line.encode('utf-8', 'replace').decode('utf-8', 'replace')
+                    pdf.multi_cell(0, 5, text_encoded)
+                    pdf.ln(2)
             
             return pdf.output(dest='S').encode('latin-1', errors='replace')
             
@@ -407,29 +500,47 @@ class EnhancedFileConverter:
 
     @classmethod
     def convert_text_file(cls, file_content: bytes, filename: str) -> Optional[bytes]:
-        """Enhanced text file conversion with multiple methods"""
+        """Enhanced text file conversion"""
         try:
-            # Try different encodings
+            # Decode with multiple encoding attempts
             text = None
             for encoding in ['utf-8', 'utf-8-sig', 'latin-1', 'cp1252', 'ascii']:
                 try:
                     text = file_content.decode(encoding, errors='ignore')
-                    break
+                    if text and text.strip():
+                        break
                 except:
                     continue
             
-            if not text:
-                text = file_content.decode('utf-8', errors='replace')
-            
-            if not text.strip():
+            if not text or not text.strip():
                 text = f"Empty or unreadable file: {filename}"
             
             title = os.path.splitext(filename)[0]
             
-            # Try conversion methods in order of quality preference
+            # Process special file types
+            if filename.lower().endswith('.md') and MARKDOWN_AVAILABLE:
+                try:
+                    # Convert markdown to HTML then to text for better formatting
+                    html_content = markdown.markdown(text)
+                    text = cls.html_to_text(html_content)
+                except Exception as e:
+                    logger.warning(f"Markdown processing failed: {e}")
+            
+            elif filename.lower().endswith(('.html', '.htm')):
+                text = cls.html_to_text(text)
+            
+            elif filename.lower().endswith('.json'):
+                try:
+                    # Pretty print JSON
+                    import json
+                    json_obj = json.loads(text)
+                    text = json.dumps(json_obj, indent=2, ensure_ascii=False)
+                except:
+                    pass  # Keep original text if JSON parsing fails
+            
+            # Try conversion methods in order of quality
             methods = [
-                (cls.create_text_pdf_weasyprint, "WeasyPrint"),
-                (cls.create_text_pdf_reportlab, "ReportLab"),
+                (cls.create_text_pdf_reportlab_enhanced, "Enhanced ReportLab"),
                 (cls.create_text_pdf_enhanced_fpdf, "Enhanced FPDF")
             ]
             
@@ -443,83 +554,120 @@ class EnhancedFileConverter:
                     logger.warning(f"{method_name} failed for {filename}: {e}")
                     continue
             
-            # All methods failed
-            return cls.create_text_pdf_enhanced_fpdf(f"All conversion methods failed for: {filename}", filename)
+            return None
             
         except Exception as e:
             logger.error(f"Text file conversion failed for {filename}: {e}")
             return cls.create_text_pdf_enhanced_fpdf(f"Error reading file {filename}: {str(e)}", filename)
 
     @classmethod
-    def convert_image_file(cls, file_content: bytes, filename: str) -> Optional[bytes]:
-        """Enhanced image conversion with better quality preservation"""
+    def convert_image_file_reportlab(cls, file_content: bytes, filename: str) -> Optional[bytes]:
+        """Convert image using ReportLab for better quality"""
         try:
+            if not REPORTLAB_AVAILABLE:
+                return None
+            
             with Image.open(io.BytesIO(file_content)) as img:
-                # Handle different image modes
+                # Convert to RGB if necessary
                 if img.mode not in ('RGB', 'L'):
                     img = img.convert('RGB')
                 
-                # Only resize if absolutely necessary (much higher threshold)
-                max_dimension = 4000  # Increased from 2000
+                # Only resize if image is extremely large
+                max_dimension = 5000  # Very high threshold
                 if img.width > max_dimension or img.height > max_dimension:
-                    # Use high-quality resampling
                     img.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
                 
-                # Try ReportLab first for better quality
-                if REPORTLAB_AVAILABLE:
-                    try:
-                        buffer = io.BytesIO()
-                        doc = SimpleDocTemplate(buffer, pagesize=A4)
-                        
-                        # Calculate image dimensions to fit page
-                        page_width, page_height = A4
-                        margin = 72  # 1 inch margin
-                        available_width = page_width - 2 * margin
-                        available_height = page_height - 2 * margin
-                        
-                        # Maintain aspect ratio
-                        img_width, img_height = img.size
-                        aspect_ratio = img_width / img_height
-                        
-                        if available_width / available_height > aspect_ratio:
-                            # Height is limiting factor
-                            new_height = available_height
-                            new_width = new_height * aspect_ratio
-                        else:
-                            # Width is limiting factor
-                            new_width = available_width
-                            new_height = new_width / aspect_ratio
-                        
-                        # Save image to BytesIO for ReportLab
-                        img_buffer = io.BytesIO()
-                        img.save(img_buffer, format='PNG', optimize=False, quality=100)
-                        img_buffer.seek(0)
-                        
-                        # Create ReportLab image
-                        rl_img = RLImage(img_buffer, width=new_width, height=new_height)
-                        
-                        story = [rl_img]
-                        doc.build(story)
-                        buffer.seek(0)
-                        return buffer.getvalue()
-                        
-                    except Exception as e:
-                        logger.warning(f"ReportLab image conversion failed: {e}")
+                # Create PDF with ReportLab
+                buffer = io.BytesIO()
                 
-                # Fallback to high-quality PIL conversion
+                # Calculate optimal page size based on image aspect ratio
+                img_width, img_height = img.size
+                aspect_ratio = img_width / img_height
+                
+                # Choose page orientation based on image
+                if aspect_ratio > 1.4:  # Wide image
+                    page_width, page_height = A4[1], A4[0]  # Landscape
+                else:
+                    page_width, page_height = A4  # Portrait
+                
+                doc = SimpleDocTemplate(buffer, pagesize=(page_width, page_height))
+                
+                # Calculate image dimensions to fit page with margins
+                margin = 36  # 0.5 inch margin
+                available_width = page_width - 2 * margin
+                available_height = page_height - 2 * margin
+                
+                # Scale image to fit while maintaining aspect ratio
+                if available_width / available_height > aspect_ratio:
+                    new_height = available_height
+                    new_width = new_height * aspect_ratio
+                else:
+                    new_width = available_width
+                    new_height = new_width / aspect_ratio
+                
+                # Save image to BytesIO with high quality
+                img_buffer = io.BytesIO()
+                img.save(img_buffer, format='PNG', optimize=False, quality=100)
+                img_buffer.seek(0)
+                
+                # Create ReportLab image
+                rl_img = RLImage(img_buffer, width=new_width, height=new_height)
+                
+                # Add title
+                styles = getSampleStyleSheet()
+                title_style = ParagraphStyle(
+                    'ImageTitle',
+                    parent=styles['Title'],
+                    fontSize=14,
+                    spaceAfter=20,
+                    alignment=TA_CENTER
+                )
+                
+                story = [
+                    Paragraph(os.path.splitext(filename)[0], title_style),
+                    rl_img
+                ]
+                
+                doc.build(story)
+                buffer.seek(0)
+                return buffer.getvalue()
+                
+        except Exception as e:
+            logger.error(f"ReportLab image conversion failed: {e}")
+            return None
+
+    @classmethod
+    def convert_image_file(cls, file_content: bytes, filename: str) -> Optional[bytes]:
+        """Enhanced image conversion with multiple methods"""
+        try:
+            # Try ReportLab first for better quality
+            pdf_bytes = cls.convert_image_file_reportlab(file_content, filename)
+            if pdf_bytes:
+                return pdf_bytes
+            
+            # Fallback to PIL
+            with Image.open(io.BytesIO(file_content)) as img:
+                if img.mode not in ('RGB', 'L'):
+                    img = img.convert('RGB')
+                
+                # Minimal resizing - only for extremely large images
+                max_dimension = 4000
+                if img.width > max_dimension or img.height > max_dimension:
+                    img.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
+                
+                # High-quality PDF conversion
                 pdf_buffer = io.BytesIO()
                 img.save(pdf_buffer, format='PDF', optimize=False, quality=100, resolution=300)
                 return pdf_buffer.getvalue()
                 
         except Exception as e:
             logger.error(f"Image conversion failed for {filename}: {e}")
-            # Create fallback PDF with error message
             return cls.create_text_pdf_enhanced_fpdf(
                 f"Failed to convert image: {filename}\nError: {str(e)}", filename)
 
     @classmethod
     def convert_docx_file_mammoth(cls, file_content: bytes) -> Optional[str]:
-        """Convert DOCX using Mammoth for better formatting preservation"""
+        """Convert DOCX using Mammoth"""
         try:
             if not MAMMOTH_AVAILABLE:
                 return None
@@ -530,7 +678,8 @@ class EnhancedFileConverter:
             if result.messages:
                 logger.info(f"Mammoth conversion messages: {result.messages}")
             
-            return html_content
+            # Convert HTML to text with formatting
+            return cls.html_to_text(html_content)
             
         except Exception as e:
             logger.error(f"Mammoth DOCX conversion failed: {e}")
@@ -538,43 +687,43 @@ class EnhancedFileConverter:
 
     @classmethod
     def extract_docx_text_advanced(cls, file_content: bytes) -> str:
-        """Advanced DOCX text extraction with multiple methods"""
+        """Advanced DOCX text extraction"""
         try:
-            # Method 1: Try Mammoth for HTML conversion
-            html_content = cls.convert_docx_file_mammoth(file_content)
-            if html_content:
-                # Convert HTML to plain text with some formatting preservation
-                import re
-                # Remove script and style elements
-                html_content = re.sub(r'<script[^>]*>.*?</script>', '', html_content, flags=re.DOTALL | re.IGNORECASE)
-                html_content = re.sub(r'<style[^>]*>.*?</style>', '', html_content, flags=re.DOTALL | re.IGNORECASE)
-                # Convert common HTML elements
-                html_content = re.sub(r'<h[1-6][^>]*>(.*?)</h[1-6]>', r'\n# \1\n', html_content)
-                html_content = re.sub(r'<p[^>]*>(.*?)</p>', r'\1\n\n', html_content)
-                html_content = re.sub(r'<br[^>]*/?>', '\n', html_content)
-                html_content = re.sub(r'<li[^>]*>(.*?)</li>', r'• \1\n', html_content)
-                html_content = re.sub(r'<[^>]+>', '', html_content)  # Remove remaining tags
-                html_content = re.sub(r'\n\s*\n', '\n\n', html_content)  # Clean up extra newlines
-                return html_content.strip()
+            # Method 1: Try Mammoth
+            text = cls.convert_docx_file_mammoth(file_content)
+            if text and text.strip():
+                return text
             
-            # Method 2: Try python-docx library
+            # Method 2: Try python-docx
             if PYTHON_DOCX_AVAILABLE:
                 doc = python_docx.Document(io.BytesIO(file_content))
                 paragraphs = []
                 
                 for paragraph in doc.paragraphs:
                     if paragraph.text.strip():
-                        paragraphs.append(paragraph.text)
+                        # Check if it's a heading
+                        if paragraph.style.name.startswith('Heading'):
+                            level = paragraph.style.name.replace('Heading ', '')
+                            if level.isdigit():
+                                paragraphs.append(f"{'#' * int(level)} {paragraph.text}")
+                            else:
+                                paragraphs.append(f"# {paragraph.text}")
+                        else:
+                            paragraphs.append(paragraph.text)
                 
-                # Also extract text from tables
+                # Extract tables
                 for table in doc.tables:
+                    table_data = []
                     for row in table.rows:
-                        row_text = []
+                        row_data = []
                         for cell in row.cells:
                             if cell.text.strip():
-                                row_text.append(cell.text.strip())
-                        if row_text:
-                            paragraphs.append(" | ".join(row_text))
+                                row_data.append(cell.text.strip())
+                        if row_data:
+                            table_data.append(" | ".join(row_data))
+                    
+                    if table_data:
+                        paragraphs.append("\n".join(table_data))
                 
                 if paragraphs:
                     return '\n\n'.join(paragraphs)
@@ -588,7 +737,7 @@ class EnhancedFileConverter:
 
     @classmethod
     def extract_docx_text_xml(cls, file_content: bytes) -> str:
-        """Extract text from DOCX using XML parsing (improved version)"""
+        """Extract text from DOCX using XML parsing"""
         try:
             with zipfile.ZipFile(io.BytesIO(file_content), 'r') as docx_zip:
                 if 'word/document.xml' not in docx_zip.namelist():
@@ -597,7 +746,6 @@ class EnhancedFileConverter:
                 xml_content = docx_zip.read('word/document.xml')
                 root = ET.fromstring(xml_content)
                 
-                # Extract text with better structure preservation
                 paragraphs = []
                 current_paragraph = []
                 
@@ -613,7 +761,6 @@ class EnhancedFileConverter:
                     elif tag_name == 'br':  # Line break
                         current_paragraph.append('\n')
                 
-                # Don't forget the last paragraph
                 if current_paragraph:
                     paragraphs.append(' '.join(current_paragraph))
                 
@@ -625,32 +772,14 @@ class EnhancedFileConverter:
 
     @classmethod
     def convert_docx_file(cls, file_content: bytes, filename: str) -> Optional[bytes]:
-        """Enhanced DOCX conversion with multiple quality methods"""
+        """Enhanced DOCX conversion"""
         try:
-            # Extract text with advanced methods
             text = cls.extract_docx_text_advanced(file_content)
             
             if text and text.strip() and "Error extracting" not in text:
                 title = os.path.splitext(filename)[0]
-                
-                # Try high-quality conversion methods
-                if WEASYPRINT_AVAILABLE and MAMMOTH_AVAILABLE:
-                    # Best quality: Mammoth HTML + WeasyPrint
-                    try:
-                        result = mammoth.convert_to_html(io.BytesIO(file_content))
-                        html_content = result.value
-                        if html_content:
-                            html = cls.create_html_template(title, html_content)
-                            pdf_bytes = weasyprint.HTML(string=html).write_pdf()
-                            if pdf_bytes:
-                                return pdf_bytes
-                    except Exception as e:
-                        logger.warning(f"Mammoth+WeasyPrint conversion failed: {e}")
-                
-                # Fallback to text-based conversion
-                return cls.convert_text_file(text.encode('utf-8'), filename)
+                return cls.convert_text_file(text.encode('utf-8'), f"{title}.txt")
             else:
-                # Final fallback
                 return cls.create_text_pdf_enhanced_fpdf(
                     f"Unable to extract readable content from: {filename}\n\n"
                     "This DOCX file may contain complex formatting, images, or be corrupted.\n"
@@ -683,20 +812,25 @@ class EnhancedFileConverter:
                 
                 for shape in slide.shapes:
                     if hasattr(shape, "text") and shape.text.strip():
-                        # Detect if it's a title or content
-                        if shape.placeholder_format and shape.placeholder_format.type == 1:  # Title
-                            slide_content.append(f"## {shape.text}")
+                        # Detect slide structure
+                        if hasattr(shape, 'placeholder_format') and shape.placeholder_format:
+                            if shape.placeholder_format.type == 1:  # Title
+                                slide_content.append(f"## {shape.text}")
+                            elif shape.placeholder_format.type == 2:  # Content
+                                slide_content.append(shape.text)
+                            else:
+                                slide_content.append(shape.text)
                         else:
                             slide_content.append(shape.text)
                 
-                if len(slide_content) == 1:  # Only the slide header
+                if len(slide_content) == 1:
                     slide_content.append("(No text content on this slide)")
                 
                 slides_content.append('\n\n'.join(slide_content))
             
             if slides_content:
                 full_text = '\n\n---\n\n'.join(slides_content)
-                return cls.convert_text_file(full_text.encode('utf-8'), filename)
+                return cls.convert_text_file(full_text.encode('utf-8'), f"{filename}.txt")
             else:
                 return cls.create_text_pdf_enhanced_fpdf(
                     f"No content found in presentation: {filename}", filename)
@@ -787,7 +921,6 @@ class EnhancedFileConverter:
             
         except Exception as e:
             logger.error(f"File conversion failed for {filename}: {e}")
-            # Create error PDF as final fallback
             try:
                 error_pdf = cls.create_text_pdf_enhanced_fpdf(
                     f"Conversion Error\n\n"
@@ -823,7 +956,7 @@ def count_pdf_pages(pdf_bytes: Optional[bytes]) -> int:
         return len(reader.pages)
     except Exception as e:
         logger.warning(f"Failed to count PDF pages: {e}")
-        # Try to estimate based on file size (rough estimate)
+        # Estimate based on file size
         size_kb = len(pdf_bytes) / 1024
         if size_kb < 50:
             return 1
@@ -834,7 +967,7 @@ def count_pdf_pages(pdf_bytes: Optional[bytes]) -> int:
 
 # --------- Streamlit Configuration ----------
 st.set_page_config(
-    page_title="Autoprint (Enhanced)", 
+    page_title="Autoprint (Cloud-Compatible)", 
     layout="wide", 
     page_icon="🖨️",
     initial_sidebar_state="expanded"
@@ -879,11 +1012,17 @@ st.markdown("""
         padding: 0.75rem;
         margin: 0.5rem 0;
     }
+    .cloud-compatible {
+        background-color: #e3f2fd;
+        border-left: 4px solid #2196f3;
+        padding: 0.75rem;
+        margin: 0.5rem 0;
+    }
 </style>
 """, unsafe_allow_html=True)
 
 # --------- Header ----------
-st.markdown("<h1 style='text-align:center; margin-bottom:2rem;'>🖨️ Autoprint - Enhanced Quality Converter</h1>", unsafe_allow_html=True)
+st.markdown("<h1 style='text-align:center; margin-bottom:2rem;'>🖨️ Autoprint - Cloud-Compatible Enhanced Converter</h1>", unsafe_allow_html=True)
 
 # --------- Initialize Session State ----------
 def init_session_state():
@@ -917,7 +1056,7 @@ def set_status(message: str):
 
 # --------- Firestore Initialization ----------
 COLLECTION = "files"
-CHUNK_SIZE = 200_000  # characters per chunk
+CHUNK_SIZE = 200_000
 
 db = None
 FIRESTORE_OK = False
@@ -931,21 +1070,17 @@ def init_firestore():
         return
     
     try:
-        # Get service account from Streamlit secrets
         if not hasattr(st, "secrets") or "firebase_service_account" not in st.secrets:
             raise RuntimeError("Add 'firebase_service_account' to Streamlit Secrets")
         
         service_account_info = st.secrets["firebase_service_account"]
         
-        # Handle both dict and JSON string formats
         if isinstance(service_account_info, str):
             service_account_info = json.loads(service_account_info)
         
-        # Fix newlines in private key
         if "private_key" in service_account_info:
             service_account_info["private_key"] = service_account_info["private_key"].replace("\\n", "\n")
         
-        # Initialize Firebase app if not already done
         try:
             app = firebase_admin.get_app()
         except ValueError:
@@ -962,7 +1097,6 @@ def init_firestore():
         set_status(f"Firestore initialization failed: {e}")
         logger.error(f"Firestore init error: {e}")
 
-# Initialize Firestore
 init_firestore()
 
 # --------- Utility Functions ----------
@@ -1012,7 +1146,6 @@ def upload_files_to_firestore(converted_files: List[ConvertedFile], job_settings
         job_id = str(uuid.uuid4())[:12]
         set_status(f"Starting upload for job {job_id}")
         
-        # Prepare file metadata
         files_metadata = []
         total_chunks = 0
         
@@ -1024,7 +1157,6 @@ def upload_files_to_firestore(converted_files: List[ConvertedFile], job_settings
                 st.warning(f"⚠️ No PDF data for {cf.orig_name}, skipping")
                 continue
             
-            # Convert to base64 and chunk
             b64_data = base64.b64encode(pdf_data).decode('utf-8')
             chunks = [b64_data[i:i+CHUNK_SIZE] for i in range(0, len(b64_data), CHUNK_SIZE)]
             
@@ -1056,19 +1188,16 @@ def upload_files_to_firestore(converted_files: List[ConvertedFile], job_settings
             st.error("❌ No valid files to upload after processing.")
             return False
         
-        # Upload progress bar
         progress_bar = st.progress(0.0)
         status_text = st.empty()
         uploaded_chunks = 0
         
-        # Upload chunks for each file
         for file_meta in files_metadata:
             file_id = file_meta["file_id"]
             filename = file_meta["filename"]
             
             status_text.text(f"Uploading {filename}...")
             
-            # Upload file chunks
             for chunk_index, chunk_data in enumerate(file_meta["chunks"]):
                 chunk_doc_id_str = chunk_doc_id(file_id, chunk_index)
                 
@@ -1084,11 +1213,9 @@ def upload_files_to_firestore(converted_files: List[ConvertedFile], job_settings
                 retry_with_backoff(upload_chunk, attempts=3)
                 uploaded_chunks += 1
                 
-                # Update progress
                 progress = uploaded_chunks / total_chunks
                 progress_bar.progress(progress)
             
-            # Upload file metadata
             meta_doc = {
                 "total_chunks": file_meta["total_chunks"],
                 "file_name": file_meta["filename"],
@@ -1116,7 +1243,6 @@ def upload_files_to_firestore(converted_files: List[ConvertedFile], job_settings
         progress_bar.progress(1.0)
         status_text.text("✅ Upload completed!")
         
-        # Wait for payment info from receiver
         poll_for_payment_info(files_metadata, job_settings)
         
         return True
@@ -1130,19 +1256,15 @@ def poll_for_payment_info(files_metadata: List[dict], job_settings: dict):
     """Poll Firestore for payment information from receiver"""
     
     set_status("Waiting for payment information from receiver...")
-    
-    # Show local estimate first
     show_local_estimate(files_metadata, job_settings)
     
-    # Poll for official payment info
     poll_start = time.time()
-    max_poll_time = 120  # 2 minutes
+    max_poll_time = 120
     
     progress_container = st.container()
     
     while time.time() - poll_start < max_poll_time:
         try:
-            # Check each file's metadata for payment info
             for file_meta in files_metadata:
                 file_id = file_meta["file_id"]
                 
@@ -1157,7 +1279,6 @@ def poll_for_payment_info(files_metadata: List[dict], job_settings: dict):
                         set_status("✅ Received official payment information!")
                         return
             
-            # Update polling status
             elapsed = int(time.time() - poll_start)
             remaining = max_poll_time - elapsed
             
@@ -1170,7 +1291,6 @@ def poll_for_payment_info(files_metadata: List[dict], job_settings: dict):
             logger.error(f"Polling error: {e}")
             break
     
-    # Timeout reached
     set_status("⚠️ Timeout waiting for official payment info. Using local estimate.")
 
 def show_local_estimate(files_metadata: List[dict], job_settings: dict):
@@ -1185,11 +1305,9 @@ def show_local_estimate(files_metadata: List[dict], job_settings: dict):
             pages = file_meta["pages"]
             copies = job_settings.get("copies", 1)
             
-            # Determine if color printing
             color_mode = job_settings.get("color_mode", "Color")
             is_color = "color" in color_mode.lower()
             
-            # Check for duplex
             duplex_setting = file_meta["settings"].get("duplex", "Single-sided")
             is_duplex = "duplex" in duplex_setting.lower() or "two" in duplex_setting.lower()
             
@@ -1197,7 +1315,6 @@ def show_local_estimate(files_metadata: List[dict], job_settings: dict):
             total_amount += file_amount
             total_pages += pages * copies
         
-        # Create payment info object
         job_id = files_metadata[0]["job_id"]
         file_name = files_metadata[0]["filename"] if len(files_metadata) == 1 else "Multiple Files"
         
@@ -1236,15 +1353,11 @@ def handle_online_payment():
         st.error("❌ UPI ID not available")
         return
     
-    # Generate UPI URI
     upi_uri = generate_upi_uri(upi_id, amount, f"Print: {file_name}")
     
     st.success(f"💳 Please pay ₹{amount:.2f} via UPI")
-    
-    # Create payment link
     st.markdown(f"### [🚀 Open Payment App]({upi_uri})")
     
-    # Generate QR code if available
     if QR_AVAILABLE:
         try:
             qr = qrcode.QRCode(version=1, box_size=8, border=2)
@@ -1253,7 +1366,6 @@ def handle_online_payment():
             
             qr_img = qr.make_image(fill_color="black", back_color="white")
             
-            # Convert PIL image to bytes for Streamlit
             img_buffer = io.BytesIO()
             qr_img.save(img_buffer, format='PNG')
             img_buffer.seek(0)
@@ -1263,7 +1375,6 @@ def handle_online_payment():
         except Exception as e:
             logger.warning(f"QR code generation failed: {e}")
     
-    # Try to open payment app automatically
     try:
         webbrowser.open(upi_uri)
     except:
@@ -1305,25 +1416,35 @@ def cancel_payment():
 with st.sidebar:
     st.title("📋 System Info")
     
-    # Quality Enhancement Status
-    with st.expander("🌟 Quality Enhancement Status"):
-        enhancement_status = []
-        if WEASYPRINT_AVAILABLE:
-            enhancement_status.append("✅ WeasyPrint - HTML to PDF")
-        else:
-            enhancement_status.append("❌ WeasyPrint - Install for best HTML conversion")
-            
+    # Cloud Compatibility Status
+    with st.expander("☁️ Cloud Compatibility Status"):
+        st.markdown('<div class="cloud-compatible">✅ Optimized for Streamlit Cloud</div>', unsafe_allow_html=True)
+        
+        compatibility_status = []
         if REPORTLAB_AVAILABLE:
-            enhancement_status.append("✅ ReportLab - Advanced PDF generation")
+            compatibility_status.append("✅ ReportLab - Advanced PDF generation")
         else:
-            enhancement_status.append("❌ ReportLab - Install for better text/image PDFs")
+            compatibility_status.append("⚠️ ReportLab - Recommended for best quality")
             
         if MAMMOTH_AVAILABLE:
-            enhancement_status.append("✅ Mammoth - DOCX to HTML conversion")
+            compatibility_status.append("✅ Mammoth - Enhanced DOCX conversion")
         else:
-            enhancement_status.append("❌ Mammoth - Install for better DOCX quality")
+            compatibility_status.append("⚠️ Mammoth - Recommended for DOCX files")
             
-        for status in enhancement_status:
+        if MARKDOWN_AVAILABLE:
+            compatibility_status.append("✅ Markdown - Enhanced Markdown processing")
+        else:
+            compatibility_status.append("⚠️ Markdown - Recommended for .md files")
+            
+        if BS4_AVAILABLE:
+            compatibility_status.append("✅ BeautifulSoup - HTML processing")
+        else:
+            compatibility_status.append("⚠️ BeautifulSoup - Recommended for HTML files")
+        
+        # WeasyPrint is intentionally disabled
+        compatibility_status.append("⚠️ WeasyPrint - Disabled (Cloud incompatible)")
+            
+        for status in compatibility_status:
             st.write(status)
     
     # Environment status
@@ -1335,36 +1456,17 @@ with st.sidebar:
         st.write(f"**python-pptx:** {'✅ Available' if PYTHON_PPTX_AVAILABLE else '❌ Not Available'}")
         st.write(f"**QR Code:** {'✅ Available' if QR_AVAILABLE else '❌ Not Available'}")
     
-    # Supported formats
-    with st.expander("📄 Supported Formats"):
-        st.write("**✅ Enhanced Support:**")
-        st.write("• PDF (passthrough)")
-        st.write("• Text: txt, md, rtf, html, csv, xml, json")
-        st.write("• Images: png, jpg, jpeg, bmp, tiff, webp")
-        st.write("• Documents: docx, pptx")
-        
-        st.write("**🔧 Installation Commands:**")
+    # Installation guide
+    with st.expander("📦 Recommended Packages"):
         st.code("""
-pip install weasyprint reportlab mammoth
-# For better font support:
-pip install fonttools
+# Cloud-compatible packages
+pip install reportlab mammoth markdown beautifulsoup4
+
+# Note: WeasyPrint skipped due to system dependencies
         """)
 
-# Quality Enhancement Notice
-if not all([WEASYPRINT_AVAILABLE, REPORTLAB_AVAILABLE, MAMMOTH_AVAILABLE]):
-    st.warning("""
-    🚀 **Enhanced Quality Available!**
-    
-    Install additional libraries for significantly better PDF quality:
-    ```
-    pip install weasyprint reportlab mammoth
-    ```
-    
-    These libraries provide:
-    - **WeasyPrint**: Professional HTML to PDF conversion
-    - **ReportLab**: Advanced PDF generation with better formatting
-    - **Mammoth**: High-quality DOCX to HTML conversion
-    """)
+# Cloud Compatibility Notice
+st.markdown('<div class="cloud-compatible">☁️ <strong>Cloud-Optimized Version</strong><br>This version is specifically optimized for Streamlit Cloud and avoids problematic system dependencies like WeasyPrint\'s Pango requirements.</div>', unsafe_allow_html=True)
 
 # User Information Section
 st.markdown("### 👤 User Information")
@@ -1397,22 +1499,20 @@ else:
         "Choose files to print",
         accept_multiple_files=True,
         type=['pdf', 'txt', 'md', 'rtf', 'html', 'htm', 'png', 'jpg', 'jpeg', 'bmp', 'tiff', 'webp', 'docx', 'pptx', 'csv', 'xml', 'json'],
-        help="Select one or more files. Enhanced quality conversion available for most formats!"
+        help="Select one or more files. Cloud-optimized quality conversion available!"
     )
     
     if uploaded_files:
-        # Convert uploaded files
-        with st.spinner("🔄 Converting files with enhanced quality..."):
+        with st.spinner("🔄 Converting files with cloud-optimized quality..."):
             converted_files = []
             conversion_results = []
             
             for uploaded_file in uploaded_files:
                 try:
-                    converted_file = EnhancedFileConverter.convert_uploaded_file_to_pdf(uploaded_file)
+                    converted_file = CloudCompatibleFileConverter.convert_uploaded_file_to_pdf(uploaded_file)
                     if converted_file:
                         converted_files.append(converted_file)
                         
-                        # Determine quality level based on conversion method
                         quality_indicator = "🌟 Enhanced" if "enhanced" in converted_file.conversion_method else "📄 Standard"
                         
                         conversion_results.append({
@@ -1461,11 +1561,10 @@ else:
                     with col5:
                         st.write(f"Pages: {result['pages']}")
                     
-                    # Quality enhancement notice
                     if "enhanced" in result.get('method', ''):
                         st.markdown('<div class="quality-indicator">🌟 Enhanced quality conversion applied!</div>', unsafe_allow_html=True)
         
-        # File Preview Section (same as before)
+        # File Preview Section
         if converted_files:
             st.markdown("#### 👀 File Preview")
             
@@ -1479,7 +1578,6 @@ else:
                         st.write(f"**Method:** {cf.conversion_method}")
                         st.write(f"**Size:** {len(cf.pdf_bytes):,} bytes")
                         
-                        # Quality indicator
                         if "enhanced" in cf.conversion_method:
                             st.success("🌟 Enhanced quality conversion")
                         else:
@@ -1487,7 +1585,6 @@ else:
                     
                     with col2:
                         if st.button(f"👁️ Preview", key=f"preview_{i}"):
-                            # Create inline PDF viewer
                             b64_pdf = base64.b64encode(cf.pdf_bytes).decode('utf-8')
                             pdf_display = f"""
                             <iframe src="data:application/pdf;base64,{b64_pdf}" 
@@ -1505,7 +1602,7 @@ else:
                             key=f"download_{i}"
                         )
         
-        # Print Job Settings (same as before)
+        # Print Job Settings
         if converted_files:
             st.markdown("#### ⚙️ Print Job Settings")
             
@@ -1564,13 +1661,12 @@ else:
 if st.session_state.get("status"):
     st.info(f"📊 **Status:** {st.session_state.status}")
 
-# Payment Section (same as before)
+# Payment Section
 payinfo = st.session_state.get("payinfo")
 if payinfo and not st.session_state.get("process_complete"):
     st.markdown("---")
     st.markdown("### 💳 Payment Required")
     
-    # Payment details
     col1, col2 = st.columns(2)
     
     with col1:
@@ -1609,7 +1705,6 @@ if st.session_state.get("process_complete"):
     st.info("Your files have been sent to the print shop. Please proceed with payment and collect your prints.")
     
     if st.button("🔄 Start New Print Job", type="primary"):
-        # Reset session state for new job
         st.session_state.converted_files = []
         st.session_state.payinfo = None
         st.session_state.process_complete = False
@@ -1617,81 +1712,83 @@ if st.session_state.get("process_complete"):
         st.session_state.user_id = str(uuid.uuid4())[:8]
         st.rerun()
 
-# Installation Instructions
-if not all([WEASYPRINT_AVAILABLE, REPORTLAB_AVAILABLE, MAMMOTH_AVAILABLE]):
-    st.markdown("---")
-    with st.expander("🔧 **Installation Guide for Enhanced Quality**"):
-        st.markdown("""
-        ### Install Enhanced PDF Libraries
-        
-        To get the best PDF conversion quality, install these libraries:
-        
-        ```bash
-        # Core libraries for enhanced PDF conversion
-        pip install weasyprint reportlab mammoth
-        
-        # Additional font support (optional but recommended)
-        pip install fonttools
-        
-        # For better image handling
-        pip install pillow
-        ```
-        
-        ### Library Benefits:
-        
-        **WeasyPrint** 🌟
-        - Professional HTML to PDF conversion
-        - Supports CSS styling and complex layouts
-        - Best for text documents with formatting
-        
-        **ReportLab** 📊
-        - Advanced PDF generation engine
-        - Better text rendering and image handling
-        - Supports complex layouts and graphics
-        
-        **Mammoth** 📝
-        - High-quality DOCX to HTML conversion
-        - Preserves formatting, styles, and structure
-        - Much better than basic XML parsing
-        
-        ### Platform-specific Notes:
-        
-        **Windows:**
-        ```bash
-        pip install weasyprint
-        # If you get DLL errors, also install:
-        pip install --upgrade pip setuptools wheel
-        ```
-        
-        **Linux (Ubuntu/Debian):**
-        ```bash
-        sudo apt-get install python3-dev python3-pip python3-cffi python3-brotli libpango-1.0-0 libharfbuzz0b libpangoft2-1.0-0
-        pip install weasyprint reportlab mammoth
-        ```
-        
-        **macOS:**
-        ```bash
-        brew install cairo pango gdk-pixbuf libffi
-        pip install weasyprint reportlab mammoth
-        ```
-        
-        ### Quality Comparison:
-        
-        | Feature | Standard | Enhanced |
-        |---------|----------|----------|
-        | Text Quality | Basic | Professional |
-        | Image Resolution | Compressed | High Quality |
-        | DOCX Formatting | Limited | Full Support |
-        | Font Support | Basic | Advanced |
-        | Layout Preservation | Minimal | Excellent |
-        """)
+# Cloud Deployment Guide
+st.markdown("---")
+with st.expander("☁️ **Cloud Deployment Guide**"):
+    st.markdown("""
+    ### Cloud-Compatible Package Requirements
+    
+    This version is optimized for Streamlit Cloud deployment. Add these to your `requirements.txt`:
+    
+    ```
+    streamlit
+    firebase-admin
+    reportlab
+    mammoth
+    markdown
+    beautifulsoup4
+    pillow
+    pypdf
+    python-docx
+    python-pptx
+    qrcode[pil]
+    fpdf2
+    ```
+    
+    ### Why WeasyPrint is Disabled
+    
+    WeasyPrint requires system libraries (`libpango`, `libcairo`, etc.) that are not available on most cloud platforms including:
+    - Streamlit Cloud
+    - Heroku
+    - Vercel
+    - Netlify
+    
+    This version uses **ReportLab** instead, which provides:
+    - ✅ Pure Python implementation
+    - ✅ No system dependencies
+    - ✅ Professional PDF quality
+    - ✅ Cloud platform compatible
+    
+    ### Quality Comparison
+    
+    | Feature | WeasyPrint | ReportLab (This Version) |
+    |---------|------------|--------------------------|
+    | Cloud Compatible | ❌ No | ✅ Yes |
+    | System Dependencies | ❌ Many | ✅ None |
+    | Text Quality | Excellent | Very Good |
+    | Image Quality | Excellent | Excellent |
+    | DOCX Support | Good | Very Good (with Mammoth) |
+    | Deployment Ease | ❌ Complex | ✅ Simple |
+    
+    ### Local Development
+    
+    If you want to use WeasyPrint locally, you can install it separately:
+    
+    **Ubuntu/Debian:**
+    ```bash
+    sudo apt-get install python3-dev python3-pip python3-cffi python3-brotli libpango-1.0-0 libharfbuzz0b libpangoft2-1.0-0
+    pip install weasyprint
+    ```
+    
+    **macOS:**
+    ```bash
+    brew install cairo pango gdk-pixbuf libffi
+    pip install weasyprint
+    ```
+    
+    **Windows:**
+    ```bash
+    # Use WSL or Docker for best results
+    pip install weasyprint  # May require additional setup
+    ```
+    """)
 
 # Footer
 st.markdown("---")
 st.markdown(
     "<div style='text-align: center; color: #666; padding: 1rem;'>"
-    "🖨️ <strong>Autoprint Enhanced</strong> - High-Quality PDF Converter<br>"
-    "<small>Enhanced with WeasyPrint, ReportLab, and Mammoth for professional-grade PDF conversion</small>"
+    "🖨️ <strong>Autoprint Cloud-Compatible</strong> - Enhanced PDF Converter<br>"
+    "<small>Optimized for Streamlit Cloud with ReportLab, Mammoth, and enhanced processing</small>"
     "</div>", 
     unsafe_allow_html=True
 )
