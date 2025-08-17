@@ -28,7 +28,6 @@ import queue
 import zlib
 from typing import Tuple
 
-
 # Firebase
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -660,7 +659,9 @@ def send_job_to_firestore(files: List[Dict[str, Any]], user_name: str = "", user
         "user_name": user_name or "",
         "user_id": user_id or "",
         "timestamp": firestore.SERVER_TIMESTAMP,
-        "transfer_mode": "file_share"
+        "transfer_mode": "file_share",
+        # we intentionally don't include payinfo here — receiver will write payinfo when
+        # it downloads the files and creates an order.
     }
     db.collection(COLLECTION).document(f"{job_id}_meta").set(job_meta)
 
@@ -691,6 +692,13 @@ def attach_job_listener(job_id: str):
             # if payinfo field present, push to ACK_QUEUE
             if "payinfo" in data:
                 ACK_QUEUE.put(("payinfo", data.get("payinfo")))
+                # Also watch for payinfo-level paid flag
+                pi = data.get("payinfo") or {}
+                if isinstance(pi, dict) and (pi.get("paid") or pi.get("status") in ("paid", "completed", "received")):
+                    ACK_QUEUE.put(("payment", {"job_id": job_id, "payinfo": pi}))
+            # also check top-level fields that receivers or ops might set to indicate payment
+            if data.get("payment_received") is True or data.get("payment_status") in ("paid", "completed", "received"):
+                ACK_QUEUE.put(("payment", {"job_id": job_id, "payload": data}))
             # if job-level order_ids or final status present, push as ack(s)
             if "final_acks" in data:
                 # final_acks expected to be list of dicts similar to earlier socket ack
@@ -784,6 +792,8 @@ if "job_listener" not in st.session_state:
     st.session_state["job_listener"] = None
 if "current_job_id" not in st.session_state:
     st.session_state["current_job_id"] = None
+if "waiting_for_payment" not in st.session_state:
+    st.session_state["waiting_for_payment"] = False
 
 def set_status(s):
     st.session_state["status"] = f"{datetime.datetime.now().strftime('%H:%M:%S')} - {s}"
@@ -799,13 +809,28 @@ def pay_offline():
     payinfo = st.session_state.get("payinfo", {})
     amount = payinfo.get("amount", 0)
     currency = payinfo.get("currency", "INR")
+    # Mark payment as confirmed offline in Firestore (so receiver knows)
+    job_id = st.session_state.get("current_job_id")
+    try:
+        if job_id:
+            doc_ref = db.collection(COLLECTION).document(f"{job_id}_meta")
+            doc_ref.update({
+                "payment_confirmed_by": st.session_state.get("user_id"),
+                "payment_method": "offline",
+                "payment_time": firestore.SERVER_TIMESTAMP,
+                # Also set a payment flag for convenience
+                "payment_received": True
+            })
+    except Exception:
+        logger.debug("Failed to mark offline payment in Firestore:\n" + traceback.format_exc())
     set_status("Payment completed (offline).")
-    st.success(f"💵 **Please pay ₹{amount} {currency} offline**")
+    st.success(f"💵 **Please pay ₹{amount} {currency} offline — marked as 'offline paid'**")
     st.success("✅ **Thank you for using our service!**")
     st.balloons()
     st.session_state["payinfo"] = None
     st.session_state["process_complete"] = True
-    # stop listener if any
+    st.session_state["waiting_for_payment"] = False
+    # stop listener if any (optional)
     detach_job_listener()
     st.session_state["current_job_id"] = None
 
@@ -818,6 +843,21 @@ def pay_online():
     amount = payinfo.get("amount", 0)
     file_name = payinfo.get("file_name", "Print Job")
     upi_uri = generate_upi_uri(owner_upi, amount, note=f"Print: {file_name}")
+
+    # Mark that user attempted online payment (so receiver sees it)
+    job_id = st.session_state.get("current_job_id")
+    try:
+        if job_id:
+            doc_ref = db.collection(COLLECTION).document(f"{job_id}_meta")
+            doc_ref.update({
+                "payment_attempted_by": st.session_state.get("user_id"),
+                "payment_attempt_time": firestore.SERVER_TIMESTAMP,
+                "payment_method": "upi_intent"
+            })
+    except Exception:
+        logger.debug("Failed to mark payment attempt in Firestore:\n" + traceback.format_exc())
+
+    # Open UPI URI and show QR if available
     st.markdown(f"**💳 Pay ₹{amount} via UPI**")
     st.markdown(f"[🚀 **Open Payment App**]({upi_uri})")
     if QR_AVAILABLE:
@@ -833,12 +873,12 @@ def pay_online():
         webbrowser.open(upi_uri)
     except Exception:
         pass
-    st.info("📱 **You will be redirected to your payment app. Complete the payment there.**")
-    st.success("✅ **Thank you for using our service!**")
-    st.balloons()
-    # keep listener active to watch for final ack
-    st.session_state["payinfo"] = None
-    st.session_state["process_complete"] = True
+
+    st.info("📱 **You will be redirected to your payment app. Complete the payment there.**\n\nWaiting for confirmation from the printing receiver...")
+    st.session_state["waiting_for_payment"] = True
+    st.session_state["process_complete"] = False
+    # Keep payinfo but clear UI action until we receive confirmation from Firestore
+    # The background listener attached to the job will detect payinfo.paid or payment_received and mark completion.
 
 def cancel_payment():
     set_status("Cancelled by user")
@@ -846,6 +886,7 @@ def cancel_payment():
     detach_job_listener()
     st.session_state["payinfo"] = None
     st.session_state["current_job_id"] = None
+    st.session_state["waiting_for_payment"] = False
 
 # Attach Firestore job listener when job created
 def start_job_listener(job_id: str):
@@ -873,6 +914,27 @@ def process_ack_queue():
             elif typ == "status":
                 # job-level status update
                 st.session_state["status"] = f"{datetime.datetime.now().strftime('%H:%M:%S')} - Job {payload.get('job_id')} status: {payload.get('status')}"
+                changed = True
+            elif typ == "payment":
+                # Payment confirmation received from receiver
+                try:
+                    # payload can vary; handle gracefully
+                    job_id = payload.get("job_id") if isinstance(payload, dict) else st.session_state.get("current_job_id")
+                    payinfo_payload = payload.get("payinfo") or payload.get("payload") or payload
+                except Exception:
+                    payinfo_payload = payload
+                    job_id = st.session_state.get("current_job_id")
+                set_status("Payment confirmed via Firestore.")
+                st.success("✅ Payment confirmed — thank you!")
+                st.balloons()
+                st.session_state["payinfo"] = None
+                st.session_state["process_complete"] = True
+                st.session_state["waiting_for_payment"] = False
+                # optionally detach listener now
+                try:
+                    detach_job_listener()
+                except Exception:
+                    pass
                 changed = True
     except queue.Empty:
         pass
@@ -918,6 +980,8 @@ def send_multiple_files_firestore(converted_files: List[ConvertedFile], copies: 
         start_job_listener(job_id)
         st.session_state["payinfo"] = None
         st.session_state["print_ack"] = None
+        st.session_state["process_complete"] = False
+        st.session_state["waiting_for_payment"] = False
     except Exception as e:
         st.error(f"Upload failed: {e}")
         set_status("Upload failed")
@@ -1042,6 +1106,7 @@ def render_print_manager_page():
         # detach_job_listener()
 
     payinfo = st.session_state.get("payinfo")
+    # Show only the two buttons during payment (Pay Online / Pay Offline)
     if payinfo and not st.session_state.get("process_complete"):
         st.markdown("---")
         st.markdown("## 💳 **Payment Required**")
@@ -1071,6 +1136,7 @@ def render_print_manager_page():
             st.session_state["print_ack"] = None
             st.session_state["current_job_id"] = None
             st.session_state["user_id"] = str(uuid.uuid4())[:8]
+            st.session_state["waiting_for_payment"] = False
             set_status("Ready for new transfer")
 
 # Convert & Format page (unchanged)
@@ -1152,4 +1218,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
