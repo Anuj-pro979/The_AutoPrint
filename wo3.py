@@ -1,4 +1,4 @@
-# wo3_autoprint_firestore_sender.py — Upgraded Autoprint with Firestore file-share sender + job manifest
+# wo3_autoprint_firestore_sender.py — Full upgraded Streamlit sender (complete)
 # Run: streamlit run wo3_autoprint_firestore_sender.py
 
 import streamlit as st
@@ -42,45 +42,18 @@ except Exception:
 # Optional QR generation
 try:
     import qrcode
-    from PIL import Image as PILImage  # avoid name clash
     QR_AVAILABLE = True
 except Exception:
     QR_AVAILABLE = False
 
-# optional imports (soft)
+# Optional auto-refresh helper (install via pip install streamlit-autorefresh)
 try:
-    import pypandoc
-    PYPANDOC_AVAILABLE = True
+    from streamlit_autorefresh import st_autorefresh
+    AUTORELOAD_AVAILABLE = True
 except Exception:
-    PYPANDOC_AVAILABLE = False
+    AUTORELOAD_AVAILABLE = False
 
-try:
-    import docx2pdf
-    DOCX2PDF_AVAILABLE = True
-except Exception:
-    DOCX2PDF_AVAILABLE = False
-
-try:
-    import comtypes.client
-    import pythoncom as _pythoncom
-    COMTYPES_AVAILABLE = True
-except Exception:
-    COMTYPES_AVAILABLE = False
-
-try:
-    import win32com.client as _win32com_client
-    import pythoncom as _pywin_pythoncom
-    WIN32COM_AVAILABLE = True
-except Exception:
-    WIN32COM_AVAILABLE = False
-
-try:
-    from spire.presentation import Presentation, FileFormat
-    SPIRE_AVAILABLE = True
-except Exception:
-    SPIRE_AVAILABLE = False
-
-# --------- Logging (file only) ----------
+# --------- Logging ----------
 LOGFILE = os.path.join(tempfile.gettempdir(), f"autoprint_{int(time.time())}.log")
 logger = logging.getLogger("autoprint")
 logger.setLevel(logging.DEBUG)
@@ -188,7 +161,7 @@ class ConvertedFile:
     settings: PrintSettings
     original_bytes: Optional[bytes] = None  # saved original upload bytes for fallback
 
-# --------- FileConverter (unchanged) ----------
+# --------- FileConverter ----------
 class FileConverter:
     SUPPORTED_TEXT_EXTENSIONS = {'.txt', '.md', '.rtf', '.html', '.htm'}
     SUPPORTED_IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.webp'}
@@ -237,6 +210,12 @@ class FileConverter:
         headless = system_is_headless()
 
         # Try docx2pdf if interactive environment and module available
+        try:
+            import docx2pdf
+            DOCX2PDF_AVAILABLE = True
+        except Exception:
+            DOCX2PDF_AVAILABLE = False
+
         if not headless and DOCX2PDF_AVAILABLE:
             try:
                 def _try_docx2pdf():
@@ -258,6 +237,13 @@ class FileConverter:
                 log(f"docx2pdf failed: {e}", "warning")
 
         # Try win32com (Windows)
+        try:
+            import win32com.client as _win32com_client
+            import pythoncom as _pywin_pythoncom
+            WIN32COM_AVAILABLE = True
+        except Exception:
+            WIN32COM_AVAILABLE = False
+
         if platform.system() == "Windows" and WIN32COM_AVAILABLE:
             try:
                 def _try_win():
@@ -320,6 +306,12 @@ class FileConverter:
                 log(f"LibreOffice conversion failed: {e}", "warning")
 
         # Try pandoc (last resort)
+        try:
+            import pypandoc
+            PYPANDOC_AVAILABLE = True
+        except Exception:
+            PYPANDOC_AVAILABLE = False
+
         if PYPANDOC_AVAILABLE:
             try:
                 def _try_pandoc():
@@ -354,6 +346,13 @@ class FileConverter:
         input_path = abspath(input_path)
         out_pdf = os.path.join(tempfile.gettempdir(), f"pptx_out_{int(time.time()*1000)}.pdf")
 
+        # Try Spire
+        try:
+            from spire.presentation import Presentation, FileFormat
+            SPIRE_AVAILABLE = True
+        except Exception:
+            SPIRE_AVAILABLE = False
+
         if SPIRE_AVAILABLE:
             try:
                 pres = Presentation()
@@ -367,6 +366,14 @@ class FileConverter:
                     return data
             except Exception as e:
                 log(f"Spire.Presentation failed: {e}", "warning")
+
+        # Try Windows COM
+        try:
+            import comtypes.client
+            import pythoncom as _pythoncom
+            COMTYPES_AVAILABLE = True
+        except Exception:
+            COMTYPES_AVAILABLE = False
 
         if platform.system() == "Windows" and COMTYPES_AVAILABLE:
             try:
@@ -440,6 +447,12 @@ class FileConverter:
                     return data
             except Exception as e:
                 log(f"LibreOffice generic failed: {e}", "warning")
+        try:
+            import pypandoc
+            PYPANDOC_AVAILABLE = True
+        except Exception:
+            PYPANDOC_AVAILABLE = False
+
         if PYPANDOC_AVAILABLE:
             try:
                 pandoc_exec = find_executable(["pandoc"])
@@ -494,39 +507,8 @@ class FileConverter:
             logger.debug(traceback.format_exc())
             return None
 
-# --------- Print job helper ----------
-class PrintJobManager:
-    PRINT_PRESETS = {
-        "Standard": PrintSettings(),
-        "Draft": PrintSettings(copies=1, color_mode="Black & White", quality="Draft", collate=False),
-        "High Quality Duplex": PrintSettings(duplex="Double-sided", quality="High")
-    }
-
-    @staticmethod
-    def create_print_job(job_name: str, files: List[ConvertedFile]) -> Dict[str, Any]:
-        return {
-            "job_name": job_name,
-            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "total_files": len(files),
-            "total_size_bytes": sum(len(f.pdf_bytes) for f in files),
-            "files": [
-                {
-                    "pdf_name": file.pdf_name,
-                    "orig_name": file.orig_name,
-                    "size_bytes": len(file.pdf_bytes),
-                    "settings": file.settings.__dict__,
-                    "pdf_base64": base64.b64encode(file.pdf_bytes).decode('utf-8')
-                }
-                for file in files
-            ]
-        }
-
 # --------- Page counting helper ----------
 def count_pdf_pages(blob: Optional[bytes]) -> int:
-    """
-    Return number of pages for a PDF given as bytes.
-    If parsing fails or PyPDF2 not available -> return 1 as safe fallback.
-    """
     if not blob:
         return 1
     if not PDF_READER_AVAILABLE:
@@ -584,7 +566,7 @@ def chunk_text(text: str, size: int = CHUNK_TEXT_SIZE) -> List[str]:
 # thread-safe queue for listener -> main UI
 ACK_QUEUE = queue.Queue()
 
-# upload a single file (chunks + per-file meta) — now includes user_name/user_id in per-file manifest
+# upload a single file (chunks + per-file meta) — includes user_name/user_id in per-file manifest
 def send_file_to_firestore(file_bytes: bytes, file_name: str, user_name: str = "", user_id: str = "") -> Tuple[str, int]:
     file_sha = sha256_bytes(file_bytes)
     full_b64 = compress_and_encode_bytes(file_bytes)
@@ -608,7 +590,7 @@ def send_file_to_firestore(file_bytes: bytes, file_name: str, user_name: str = "
             batch = db.batch()
     batch.commit()
 
-    # create per-file manifest (include uploader info so receiver can find name)
+    # create per-file manifest (include uploader info)
     meta_ref = db.collection(COLLECTION).document(f"{file_id}_meta")
     meta_payload = {
         "file_id": file_id,
@@ -623,7 +605,7 @@ def send_file_to_firestore(file_bytes: bytes, file_name: str, user_name: str = "
     meta_ref.set(meta_payload)
     return file_id, total_chunks
 
-# create job manifest (multi-file) and write to Firestore — returns job_id and job_files list
+# create job manifest (multi-file) and write to Firestore — returns job_id and job_files
 def send_job_to_firestore(files: List[Dict[str, Any]], user_name: str = "", user_id: str = "") -> Tuple[str, List[Dict[str, Any]]]:
     job_id = str(uuid.uuid4())
     job_files = []
@@ -673,7 +655,6 @@ def send_job_to_firestore(files: List[Dict[str, Any]], user_name: str = "", user
 # attach listener on job manifest to receive payinfo and final ack updates
 def attach_job_listener(job_id: str):
     doc_ref = db.collection(COLLECTION).document(f"{job_id}_meta")
-    # callback runs in background thread — push events into ACK_QUEUE
     def callback(doc_snapshot, changes, read_time):
         try:
             doc = None
@@ -690,7 +671,7 @@ def attach_job_listener(job_id: str):
                 pi = data.get("payinfo") or {}
                 if isinstance(pi, dict) and (pi.get("paid") or pi.get("status") in ("paid","completed","received")):
                     ACK_QUEUE.put(("payment", {"job_id": job_id, "payinfo": pi}))
-            # also check top-level flags
+            # if top-level flags/fields indicating payment present
             if data.get("payment_received") is True or data.get("payment_status") in ("paid","completed","received"):
                 ACK_QUEUE.put(("payment", {"job_id": job_id, "payload": data}))
             if "final_acks" in data:
@@ -778,37 +759,7 @@ def detach_file_listeners():
             pass
     st.session_state["file_listeners"] = {}
 
-# --------- Streamlit layout & styles ----------
-st.set_page_config(page_title="Autoprint (Firestore Sender)", layout="wide", page_icon="🖨️", initial_sidebar_state="expanded")
-
-st.markdown(
-    """
-    <style>
-      .appview-container .main .block-container {padding-top: 10px; padding-bottom:10px;}
-      .stButton>button {padding:6px 10px;}
-      .stDownloadButton>button {padding:6px 10px;}
-      .stProgress {height:14px;}
-    </style>
-    """,
-    unsafe_allow_html=True
-)
-
-st.markdown("<h1 style='text-align:center;margin:6px 0 8px 0;'>Autoprint (Firestore Sender)</h1>", unsafe_allow_html=True)
-
-st.markdown(
-    """
-    <div style="display:flex;align-items:center;gap:10px;padding:8px;border-radius:6px;background:#f1f7ff;">
-      <strong style="font-size:13px;">Tip:</strong>
-      <span style="font-size:13px;">
-        Use the Convert & Format page to prepare PDFs. Use this page to upload selected files to Firestore,
-        which the printing receiver watches and processes.
-      </span>
-    </div>
-    """,
-    unsafe_allow_html=True
-)
-
-# Initialize session state containers
+# --------- Streamlit UI initialization keys ----------
 if 'converted_files_pm' not in st.session_state:
     st.session_state.converted_files_pm = []
 if 'converted_files_conv' not in st.session_state:
@@ -816,7 +767,6 @@ if 'converted_files_conv' not in st.session_state:
 if 'formatted_pdfs' not in st.session_state:
     st.session_state.formatted_pdfs = {}
 
-# Session keys for print manager state
 if "payinfo" not in st.session_state:
     st.session_state["payinfo"] = None
 if "status" not in st.session_state:
@@ -833,6 +783,8 @@ if "job_listener" not in st.session_state:
     st.session_state["job_listener"] = None
 if "current_job_id" not in st.session_state:
     st.session_state["current_job_id"] = None
+if "current_file_ids" not in st.session_state:
+    st.session_state["current_file_ids"] = []
 if "waiting_for_payment" not in st.session_state:
     st.session_state["waiting_for_payment"] = False
 if "file_listeners" not in st.session_state:
@@ -848,9 +800,9 @@ def generate_upi_uri(upi_id, amount, note=None):
         params.append(f"tn={quote_plus(note)}")
     return "upi://pay?" + "&".join(params)
 
-# Payment handlers (mark per-file metadata so receiver sees attempts/confirmations)
+# Payment handlers
 def pay_offline():
-    payinfo = st.session_state.get("payinfo", {})
+    payinfo = st.session_state.get("payinfo", {}) or {}
     amount = payinfo.get("amount", 0)
     currency = payinfo.get("currency", "INR")
     job_file_ids = st.session_state.get("current_file_ids", []) or []
@@ -872,7 +824,6 @@ def pay_offline():
     st.session_state["payinfo"] = None
     st.session_state["process_complete"] = True
     st.session_state["waiting_for_payment"] = False
-    # detach file listeners optionally
     detach_file_listeners()
     st.session_state["current_job_id"] = None
     st.session_state["current_file_ids"] = []
@@ -919,7 +870,7 @@ def pay_online():
     st.info("📱 **You will be redirected to your payment app. Complete the payment there.**\n\nWaiting for confirmation from the printing receiver...")
     st.session_state["waiting_for_payment"] = True
     st.session_state["process_complete"] = False
-    # keep the payinfo (so UI still displays until receiver confirms)
+    # Keep the payinfo visible until the receiver confirms (receiver should set payinfo.paid or payment_received)
 
 def cancel_payment():
     set_status("Cancelled by user")
@@ -929,14 +880,14 @@ def cancel_payment():
     st.session_state["current_job_id"] = None
     st.session_state["waiting_for_payment"] = False
 
-# Attach Firestore job listener when job created
+# Attach job listener
 def start_job_listener(job_id: str):
     detach_job_listener()
     st.session_state["current_job_id"] = job_id
     attach_job_listener(job_id)
     set_status(f"Listening for job updates: {job_id}")
 
-# Process ACK_QUEUE into session_state (must be called in main UI thread)
+# Process ACK_QUEUE into session_state
 def process_ack_queue():
     changed = False
     try:
@@ -954,12 +905,7 @@ def process_ack_queue():
                 st.session_state["status"] = f"{datetime.datetime.now().strftime('%H:%M:%S')} - Job {payload.get('job_id')} status: {payload.get('status')}"
                 changed = True
             elif typ == "payment":
-                try:
-                    job_id = payload.get("job_id") if isinstance(payload, dict) else st.session_state.get("current_job_id")
-                    payinfo_payload = payload.get("payinfo") or payload.get("payload") or payload
-                except Exception:
-                    payinfo_payload = payload
-                    job_id = st.session_state.get("current_job_id")
+                # any payment confirmation
                 set_status("Payment confirmed via Firestore.")
                 st.success("✅ Payment confirmed — thank you!")
                 st.balloons()
@@ -975,12 +921,8 @@ def process_ack_queue():
         pass
     return changed
 
-# --------- Print Manager (UI) ----------
+# send_multiple_files_firestore
 def send_multiple_files_firestore(converted_files: List[ConvertedFile], copies: int, color_mode: str):
-    """
-    Prepares files and uploads to Firestore (per-file chunks + job manifest).
-    Then attaches a listener on the job manifest and each file manifest for payinfo/final ACKs.
-    """
     if not converted_files:
         st.error("No files selected to send.")
         return
@@ -1015,7 +957,7 @@ def send_multiple_files_firestore(converted_files: List[ConvertedFile], copies: 
         # record job and file ids in session so payment actions can reference them
         st.session_state["current_job_id"] = job_id
         st.session_state["current_file_ids"] = [f["file_id"] for f in job_files]
-        # attach a listener to the job meta (existing) and to each file meta (new)
+        # attach a listener to the job meta and to each file meta
         start_job_listener(job_id)
         for f in job_files:
             try:
@@ -1032,8 +974,58 @@ def send_multiple_files_firestore(converted_files: List[ConvertedFile], copies: 
         logger.debug(traceback.format_exc())
         return
 
+# ---------------- Streamlit UI ----------------
+st.set_page_config(page_title="Autoprint (Firestore Sender)", layout="wide", page_icon="🖨️", initial_sidebar_state="expanded")
+
+st.markdown(
+    """
+    <style>
+      .appview-container .main .block-container {padding-top: 10px; padding-bottom:10px;}
+      .stButton>button {padding:6px 10px;}
+      .stDownloadButton>button {padding:6px 10px;}
+      .stProgress {height:14px;}
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
+st.markdown("<h1 style='text-align:center;margin:6px 0 8px 0;'>Autoprint (Firestore Sender)</h1>", unsafe_allow_html=True)
+
+st.markdown(
+    """
+    <div style="display:flex;align-items:center;gap:10px;padding:8px;border-radius:6px;background:#f1f7ff;">
+      <strong style="font-size:13px;">Tip:</strong>
+      <span style="font-size:13px;">
+        Use the Convert & Format page to prepare PDFs. Use this page to upload selected files to Firestore,
+        which the printing receiver watches and processes.
+      </span>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
+
 # Render Print Manager page
 def render_print_manager_page():
+    # Auto-refresh: prefer streamlit-autorefresh; fallback to JS reload while a job is active.
+    if AUTORELOAD_AVAILABLE:
+        st_autorefresh(interval=2000, key="auto_refresh_sender")  # 2s
+    else:
+        # If a job is active or waiting for payment, reload page every 2.5s using JS
+        if st.session_state.get("current_job_id") or st.session_state.get("waiting_for_payment"):
+            js = """
+            <script>
+              // reload only if page is visible (avoid aggressive reload when in background)
+              function reloadIfVisible() {
+                if (document.visibilityState === 'visible') {
+                  window.location.reload();
+                }
+              }
+              setInterval(reloadIfVisible, 2500);
+            </script>
+            """
+            components.html(js, height=0)
+
+    # process ACK_QUEUE each run
     process_ack_queue()
 
     st.header("📄 File Transfer & Print Service (Multi-file) — Firestore Sender")
@@ -1136,13 +1128,15 @@ def render_print_manager_page():
     if st.session_state.get("status"):
         st.info(f"📊 **Status:** {st.session_state['status']}")
 
+    # process ACK queue again to ensure UI updates
     process_ack_queue()
 
     if st.session_state.get("print_ack"):
         ack = st.session_state["print_ack"]
         st.success(f"🖨️ Print result: {ack.get('status')} — {ack.get('note','')}")
-        # detach_job_listener()  # optional
+        # optionally detach listeners
 
+    # Payment UI — appears when payinfo is present
     payinfo = st.session_state.get("payinfo")
     if payinfo and not st.session_state.get("process_complete"):
         st.markdown("---")
@@ -1151,9 +1145,11 @@ def render_print_manager_page():
         with col1:
             st.write(f"**📄 File(s):** {payinfo.get('file_name', payinfo.get('filename', 'Multiple'))}")
             st.write(f"**💰 Amount:** ₹{payinfo.get('amount', 0)} {payinfo.get('currency', 'INR')}")
+            st.write(f"**🔢 Order ID:** {payinfo.get('order_id', '')}")
         with col2:
             st.write(f"**📑 Pages:** {payinfo.get('pages', 'N/A')}")
             st.write(f"**📇 Copies:** {payinfo.get('copies', 1)}")
+            st.write(f"**UPI:** {payinfo.get('owner_upi', '')}")
         st.markdown("### Choose Payment Method:")
         col1, col2 = st.columns(2)
         with col1:
@@ -1162,6 +1158,7 @@ def render_print_manager_page():
         with col2:
             if st.button("💵 **Pay Offline**", use_container_width=True, key="pm_pay_offline"):
                 pay_offline()
+        st.markdown("If you already paid, wait a few seconds for the receiver to confirm and update the UI automatically.")
 
     if st.session_state.get("process_complete"):
         st.success("🎉 **Process Complete!**")
@@ -1177,7 +1174,7 @@ def render_print_manager_page():
             st.session_state["waiting_for_payment"] = False
             set_status("Ready for new transfer")
 
-# Convert & Format page (unchanged)
+# Convert & Format page (same as earlier)
 def render_convert_page():
     st.header("📄 Convert & Format")
     st.write("Batch-convert files. Converted items appear in a separate list for previewing/printing.")
