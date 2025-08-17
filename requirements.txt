@@ -9,3 +9,4 @@ rich
 markdown-it-py
 pygments
 mdurl
+firebase-admin
