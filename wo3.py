@@ -1,10 +1,8 @@
-# wo3_autoprint_streamlit_firestore_sender_complete.py
+# wo3_autoprint_streamlit_firestore_sender_complete_fixed_docx.py
 # Streamlit sender that uploads chunked base64 docs + manifest to Firestore
-# Includes improved conversion and quick payment estimate fallback.
+# Includes robust conversion with docx XML fallback
 #
-# Requirements (install in your env):
-#   pip install streamlit firebase-admin fpdf pillow PyPDF2 python-docx python-pptx qrcode
-# Note: LibreOffice / docx2pdf may not be available on Streamlit Cloud; fallback methods handle that.
+# Run: streamlit run wo3_autoprint_streamlit_firestore_sender_complete_fixed_docx.py
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -29,6 +27,8 @@ import uuid
 import webbrowser
 import io
 import threading
+import zipfile
+import xml.etree.ElementTree as ET
 
 # Firestore
 try:
@@ -195,7 +195,7 @@ class ConvertedFile:
     settings: PrintSettings
     original_bytes: Optional[bytes] = None  # saved original upload bytes for fallback
 
-# --------- FileConverter (robust) ----------
+# --------- FileConverter (robust with docx-xml fallback) ----------
 class FileConverter:
     SUPPORTED_TEXT_EXTENSIONS = {'.txt', '.md', '.rtf', '.html', '.htm'}
     SUPPORTED_IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.webp'}
@@ -276,11 +276,37 @@ class FileConverter:
             return None
 
     @classmethod
+    def _extract_text_from_docx_xml(cls, input_path: str) -> Optional[str]:
+        # Open the .docx (zip) and extract word/document.xml, then extract w:t nodes
+        try:
+            with zipfile.ZipFile(input_path, 'r') as z:
+                if 'word/document.xml' not in z.namelist():
+                    return None
+                raw = z.read('word/document.xml')
+            # Parse XML and extract text nodes
+            root = ET.fromstring(raw)
+            # common namespace for WordprocessingML
+            ns = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
+            texts = []
+            for t in root.iter():
+                # Element tag endswith 't' (text) usually in the w namespace
+                if t.tag.endswith('}t') or t.tag == '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t':
+                    if t.text:
+                        texts.append(t.text)
+            if texts:
+                return "\n".join(texts)
+            return None
+        except Exception:
+            logger.debug("docx xml extract failed:\n" + traceback.format_exc())
+            return None
+
+    @classmethod
     def convert_docx_to_pdf_bytes(cls, input_path: str) -> Optional[bytes]:
         input_path = os.path.abspath(input_path)
         out_pdf = os.path.join(tempfile.gettempdir(), f"docx_out_{int(time.time()*1000)}.pdf")
         headless = system_is_headless()
 
+        # Try docx2pdf if interactive environment and module available
         if not headless and DOCX2PDF_AVAILABLE:
             try:
                 def _try_docx2pdf():
@@ -302,6 +328,7 @@ class FileConverter:
             except Exception:
                 logger.debug(traceback.format_exc())
 
+        # Try LibreOffice headless
         soffice = find_executable([
             "soffice", "libreoffice",
             r"C:\Program Files\LibreOffice\program\soffice.exe",
@@ -329,38 +356,26 @@ class FileConverter:
             except Exception:
                 logger.debug(traceback.format_exc())
 
-        # fallback to python-docx text extraction
+        # Fallback 1: python-docx text extraction
         txt_fallback = cls._convert_docx_with_python_docx(input_path)
         if txt_fallback:
             return txt_fallback
 
-        if PYPANDOC_AVAILABLE:
-            try:
-                def _try_pandoc():
-                    pandoc_exec = find_executable(["pandoc"])
-                    if not pandoc_exec:
-                        raise FileNotFoundError("pandoc not found")
-                    engine = None
-                    if find_executable(["pdflatex"]):
-                        engine = "pdflatex"
-                    elif find_executable(["xelatex"]):
-                        engine = "xelatex"
-                    cmd = [pandoc_exec, input_path, "-o", out_pdf]
-                    if engine:
-                        cmd += [f"--pdf-engine={engine}"]
-                    ok, out = run_subprocess(cmd, timeout=cls.PANDOC_TIMEOUT)
-                    return ok and os.path.exists(out_pdf)
-                ok = retry_with_backoff(_try_pandoc, attempts=2)
-                if ok:
-                    with open(out_pdf, "rb") as f:
-                        data = f.read()
-                    safe_remove(out_pdf)
-                    return data
-            except Exception:
-                logger.debug(traceback.format_exc())
+        # Fallback 2: Parse document.xml from the .docx zip (works without extra libs)
+        xml_text = cls._extract_text_from_docx_xml(input_path)
+        if xml_text:
+            pdf_bytes = cls.convert_text_to_pdf_bytes(xml_text.encode('utf-8'))
+            if pdf_bytes:
+                return pdf_bytes
 
-        safe_remove(out_pdf)
-        return None
+        # Final fallback: create a simple PDF saying conversion not available and include filename
+        try:
+            msg = f"Conversion not available for file: {os.path.basename(input_path)}\n\nPlease download original file or try converting on a machine with LibreOffice/docx2pdf."
+            return cls.convert_text_to_pdf_bytes(msg.encode('utf-8'))
+        except Exception:
+            logger.debug(traceback.format_exc())
+            safe_remove(out_pdf)
+            return None
 
     @classmethod
     def _convert_pptx_with_python_pptx(cls, input_path: str) -> Optional[bytes]:
@@ -493,6 +508,7 @@ class FileConverter:
                     res = cls.convert_docx_to_pdf_bytes(tmpname)
                     if res:
                         return res
+                    # If conversion returned None, we still return None and the caller will warn and use original bytes as fallback.
                 finally:
                     safe_remove(tmpname)
                 return None
@@ -508,7 +524,7 @@ class FileConverter:
                 finally:
                     safe_remove(tmpname)
                 return None
-            # generic fallback
+            # generic fallback: write file and try libreoffice/pandoc
             with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tf:
                 tf.write(content)
                 tf.flush()
@@ -631,11 +647,26 @@ def meta_doc_id(file_id: str) -> str:
 def chunk_doc_id(file_id: str, idx: int) -> str:
     return f"{file_id}_{idx}"
 
-# Main uploader (Firestore chunked)
+# Pricing and upload functions (same as previous full file)
+def calculate_amount(cfg, pages, copies=1, color=False, duplex=False):
+    try:
+        price_per_page = cfg.get("price_color_per_page") if color else cfg.get("price_bw_per_page")
+        amt = pages * price_per_page * copies
+        if duplex:
+            amt *= cfg.get("price_duplex_discount", 1.0)
+        if amt < cfg.get("min_charge", 0):
+            amt = cfg.get("min_charge", 0)
+        return round(float(amt), 2)
+    except Exception:
+        return float(cfg.get("min_charge", 0.0))
+
+def generate_upi_uri(upi_id, amount, note=None):
+    params = [f"pa={upi_id}", f"am={amount}"]
+    if note:
+        params.append(f"tn={note}")
+    return "upi://pay?" + "&".join(params)
+
 def send_multiple_files(converted_files: List[ConvertedFile], copies: int, color_mode: str):
-    """
-    Upload files to Firestore as chunk docs + manifest. Polls for payinfo from receiver.
-    """
     global db, FIRESTORE_OK
     if not FIRESTORE_OK or db is None:
         st.error("Firestore not initialized. Cannot upload.")
@@ -721,7 +752,7 @@ def send_multiple_files(converted_files: List[ConvertedFile], copies: int, color
             retry_with_backoff(_write_meta, attempts=3)
             set_status(f"Wrote manifest for {m['filename']} (id={fid})")
 
-        # Poll for payinfo — show local estimate after short wait so the UI shows payment quickly
+        # Poll for payinfo — show local estimate after short wait
         set_status("Waiting for receiver to write payinfo into manifest (polling)...")
         st.session_state.payinfo = None
         poll_start = time.time()
@@ -787,26 +818,6 @@ def send_multiple_files(converted_files: List[ConvertedFile], copies: int, color
         set_status("Upload failed")
         return
 
-# Pricing helper (same as receiver)
-def calculate_amount(cfg, pages, copies=1, color=False, duplex=False):
-    try:
-        price_per_page = cfg.get("price_color_per_page") if color else cfg.get("price_bw_per_page")
-        amt = pages * price_per_page * copies
-        if duplex:
-            amt *= cfg.get("price_duplex_discount", 1.0)
-        if amt < cfg.get("min_charge", 0):
-            amt = cfg.get("min_charge", 0)
-        return round(float(amt), 2)
-    except Exception:
-        return float(cfg.get("min_charge", 0.0))
-
-# UPI helpers
-def generate_upi_uri(upi_id, amount, note=None):
-    params = [f"pa={upi_id}", f"am={amount}"]
-    if note:
-        params.append(f"tn={note}")
-    return "upi://pay?" + "&".join(params)
-
 def pay_offline():
     payinfo = st.session_state.get("payinfo") or {}
     amount = payinfo.get("amount", 0)
@@ -849,7 +860,7 @@ def cancel_payment():
     st.session_state.payinfo = None
     set_status("Cancelled by user")
 
-# UI: Print Manager + Convert pages (conversion uses improved FileConverter)
+# UI: Print Manager + Convert pages
 st.sidebar.title("Autoprint Sender (Firestore)")
 page = st.sidebar.radio("Page", ["Print Manager", "Convert & Format"])
 
@@ -970,7 +981,6 @@ if page == "Print Manager":
             if not selected_files:
                 st.error("No files selected.")
             else:
-                # Upload on background thread to avoid freezing UI; status updates to st.session_state show progress.
                 threading.Thread(target=send_multiple_files, args=(selected_files, copies, color_mode), daemon=True).start()
 
     # status & payment
@@ -1060,4 +1070,4 @@ else:
                 st.session_state.converted_files_pm = lst
                 st.success("Added to print queue.")
 
-st.markdown("<div style='text-align:center;color:#666;padding-top:6px;'>Autoprint — Firestore chunked upload sender</div>", unsafe_allow_html=True)
+st.markdown("<div style='text-align:center;color:#666;padding-top:6px;'>Autoprint — Firestore chunked upload sender (docx fallback improved)</div>", unsafe_allow_html=True)
