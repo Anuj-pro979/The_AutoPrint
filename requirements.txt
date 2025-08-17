@@ -10,3 +10,4 @@ markdown-it-py
 pygments
 mdurl
 firebase-admin
+subprocess.run
