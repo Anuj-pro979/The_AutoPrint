@@ -10,4 +10,6 @@ markdown-it-py
 pygments
 mdurl
 firebase-admin
-subprocess.run
+python-docx
+python-pptx
+pypdfium2   # optional: useful if you need alternate PDF tools
