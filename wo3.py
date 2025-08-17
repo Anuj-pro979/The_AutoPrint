@@ -1,5 +1,5 @@
-# wo3_autoprint_fixed_pages.py — Autoprint — Page-count fix included
-# Run: streamlit run wo3_autoprint_fixed_pages.py
+# wo3_autoprint_firestore_sender.py — Autoprint with Firestore file-share sender + job manifest
+# Run: streamlit run wo3_autoprint_firestore_sender.py
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -19,12 +19,17 @@ from fpdf import FPDF
 from PIL import Image
 from pathlib import Path
 import hashlib
-import socket
 import datetime
 import uuid
 import webbrowser
 import threading
-import io                                  # <-- added for BytesIO
+import io                                  # <-- for BytesIO
+import queue
+import zlib
+
+# Firebase
+import firebase_admin
+from firebase_admin import credentials, firestore
 
 # Optional PDF page counter
 try:
@@ -536,8 +541,193 @@ def count_pdf_pages(blob: Optional[bytes]) -> int:
         logger.debug("count_pdf_pages failed:\n" + traceback.format_exc())
         return 1
 
+# --------- Firestore sender utilities ----------
+# Config from secrets or default
+COLLECTION = st.secrets.get("collection_name", "files") if st.secrets else "files"
+CHUNK_TEXT_SIZE = 900_000
+MAX_BATCH_WRITE = 300
+
+def init_db_from_secrets():
+    sa_json = st.secrets.get("firebase_service_account") if st.secrets else None
+    if sa_json:
+        sa = json.loads(sa_json)
+    else:
+        fallback_path = st.secrets.get("service_account_file") if st.secrets else None
+        if not fallback_path:
+            raise RuntimeError("Provide firebase_service_account in Streamlit secrets or service_account_file path.")
+        with open(fallback_path, "r", encoding="utf-8") as f:
+            sa = json.load(f)
+    if "private_key" in sa and isinstance(sa["private_key"], str):
+        sa["private_key"] = sa["private_key"].replace("\\n", "\n")
+    try:
+        app = firebase_admin.get_app()
+    except ValueError:
+        cred = credentials.Certificate(sa)
+        app = firebase_admin.initialize_app(cred)
+    return firestore.client(app=app)
+
+# initialize Firestore client
+try:
+    db = init_db_from_secrets()
+    st.success("✅ Firebase initialized")
+except Exception as e:
+    st.error("❌ Firebase init failed: " + str(e))
+    st.stop()
+
+# helper crypto / encode
+def sha256_bytes(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+def compress_and_encode_bytes(b: bytes) -> str:
+    return base64.b64encode(zlib.compress(b)).decode("utf-8")
+
+def chunk_text(text: str, size: int = CHUNK_TEXT_SIZE) -> List[str]:
+    return [text[i:i+size] for i in range(0, len(text), size)]
+
+# thread-safe queue for listener -> main UI
+ACK_QUEUE = queue.Queue()
+
+# upload a single file (chunks + per-file meta)
+def send_file_to_firestore(file_bytes: bytes, file_name: str) -> Tuple[str, int]:
+    file_sha = sha256_bytes(file_bytes)
+    full_b64 = compress_and_encode_bytes(file_bytes)
+    chunks = chunk_text(full_b64, CHUNK_TEXT_SIZE)
+    total_chunks = len(chunks)
+    file_id = str(uuid.uuid4())
+
+    batch = db.batch()
+    written = 0
+    for idx, piece in enumerate(chunks):
+        doc_ref = db.collection(COLLECTION).document(f"{file_id}_{idx}")
+        batch.set(doc_ref, {
+            "file_name": file_name,
+            "chunk_index": idx,
+            "total_chunks": total_chunks,
+            "data": piece
+        })
+        written += 1
+        if written % MAX_BATCH_WRITE == 0:
+            batch.commit()
+            batch = db.batch()
+    batch.commit()
+
+    # create per-file manifest
+    meta_ref = db.collection(COLLECTION).document(f"{file_id}_meta")
+    meta_ref.set({
+        "file_id": file_id,
+        "file_name": file_name,
+        "total_chunks": total_chunks,
+        "sha256": file_sha,
+        "size_bytes": len(file_bytes),
+        "uploaded_at": firestore.SERVER_TIMESTAMP
+    })
+    return file_id, total_chunks
+
+# create job manifest (multi-file) and write to Firestore
+def send_job_to_firestore(files: List[Dict[str, Any]], user_name: str = "", user_id: str = "") -> str:
+    job_id = str(uuid.uuid4())
+    job_files = []
+    progress = st.progress(0)
+    total_files = len(files)
+    if total_files == 0:
+        raise ValueError("No files to upload")
+
+    for idx, f in enumerate(files):
+        file_bytes = f.get("file_bytes") or b""
+        file_name = f.get("file_name") or f"file_{int(time.time())}.pdf"
+        pages = f.get("pages") or count_pdf_pages(file_bytes)
+        settings = f.get("settings") or {}
+        st.info(f"Uploading file {idx+1}/{total_files}: {file_name}")
+        fid, total_chunks = send_file_to_firestore(file_bytes, file_name)
+        job_files.append({
+            "file_id": fid,
+            "file_name": file_name,
+            "size_bytes": len(file_bytes),
+            "pages": pages,
+            "total_chunks": total_chunks,
+            "settings": settings,
+            "will_send_converted": True
+        })
+        progress.progress(int(((idx+1) / total_files) * 100))
+
+    # job manifest
+    job_meta = {
+        "job_id": job_id,
+        "file_count": len(job_files),
+        "files": job_files,
+        "user_name": user_name or "",
+        "user_id": user_id or "",
+        "timestamp": firestore.SERVER_TIMESTAMP,
+        "transfer_mode": "file_share"
+    }
+    db.collection(COLLECTION).document(f"{job_id}_meta").set(job_meta)
+
+    try:
+        db.collection("health_check").document("last_job").set({"job_id": job_id, "ts": firestore.SERVER_TIMESTAMP})
+    except Exception:
+        pass
+    progress.empty()
+    return job_id
+
+# attach listener on job manifest to receive payinfo and final ack updates
+def attach_job_listener(job_id: str):
+    doc_ref = db.collection(COLLECTION).document(f"{job_id}_meta")
+    # callback runs in background thread — push events into ACK_QUEUE
+    def callback(doc_snapshot, changes, read_time):
+        try:
+            doc = None
+            # doc_snapshot is a list of DocumentSnapshot(s) (the first is the current)
+            if isinstance(doc_snapshot, list) and len(doc_snapshot) > 0:
+                doc = doc_snapshot[0]
+            else:
+                doc = doc_snapshot
+            if doc is None:
+                return
+            if not doc.exists:
+                return
+            data = doc.to_dict() or {}
+            # if payinfo field present, push to ACK_QUEUE
+            if "payinfo" in data:
+                ACK_QUEUE.put(("payinfo", data.get("payinfo")))
+            # if job-level order_ids or final status present, push as ack(s)
+            if "final_acks" in data:
+                # final_acks expected to be list of dicts similar to earlier socket ack
+                for a in (data.get("final_acks") or []):
+                    ACK_QUEUE.put(("ack", a))
+            # back-compat: if job_meta contains single payment info fields at top level (like order_id/amount)
+            if "order_id" in data and "amount" in data:
+                ACK_QUEUE.put(("payinfo", {
+                    "order_id": data.get("order_id"),
+                    "amount": data.get("amount"),
+                    "currency": data.get("currency"),
+                    "owner_upi": data.get("owner_upi"),
+                    "file_name": data.get("file_name"),
+                    "pages": data.get("pages"),
+                    "copies": data.get("copies"),
+                    "status": data.get("status", "queued")
+                }))
+            # if there's a job-level status update (e.g., status == "completed")
+            if "status" in data:
+                ACK_QUEUE.put(("status", {"status": data.get("status"), "job_id": job_id}))
+        except Exception:
+            logger.debug("job listener exception:\n" + traceback.format_exc())
+
+    listener = doc_ref.on_snapshot(callback)
+    # store listener handle so it can be unsubscribed later
+    st.session_state["job_listener"] = listener
+    set_status(f"Listening for job updates: {job_id}")
+
+def detach_job_listener():
+    listener = st.session_state.get("job_listener")
+    if listener:
+        try:
+            listener.unsubscribe()
+        except Exception:
+            pass
+    st.session_state["job_listener"] = None
+
 # --------- Streamlit layout & styles ----------
-st.set_page_config(page_title="Autoprint", layout="wide", page_icon="🖨️", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Autoprint (Firestore Sender)", layout="wide", page_icon="🖨️", initial_sidebar_state="expanded")
 
 st.markdown(
     """
@@ -551,16 +741,16 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-# Top title + tip (unchanged)
-st.markdown("<h1 style='text-align:center;margin:6px 0 8px 0;'>Autoprint</h1>", unsafe_allow_html=True)
+# Top title + tip
+st.markdown("<h1 style='text-align:center;margin:6px 0 8px 0;'>Autoprint (Firestore Sender)</h1>", unsafe_allow_html=True)
 
 st.markdown(
     """
     <div style="display:flex;align-items:center;gap:10px;padding:8px;border-radius:6px;background:#f1f7ff;">
       <strong style="font-size:13px;">Tip:</strong>
       <span style="font-size:13px;">
-        To edit the file into the format you want to print, go to the <strong>Convert & Format</strong> page. 
-        Convert and upload the saved format here to print.
+        Use the Convert & Format page to prepare PDFs. Use this page to upload selected files to Firestore,
+        which the printing receiver watches and processes.
       </span>
     </div>
     """,
@@ -575,34 +765,7 @@ if 'converted_files_conv' not in st.session_state:
 if 'formatted_pdfs' not in st.session_state:
     st.session_state.formatted_pdfs = {}
 
-# Sidebar
-with st.sidebar:
-    st.title("Autoprint (founder: KOTA ANUJ KUMAR)")
-    st.markdown("**Founder:** Kota Anuj kumar")
-    page = st.radio("Page", ["Print Manager", "Convert & Format"], index=0)
-    st.markdown("---")
-    st.caption("Print Manager is the default. Use Convert & Format to batch-convert files.")
-    with st.expander("Environment (compact)", expanded=False):
-        st.write(f"Platform: {platform.system()}")
-        st.write("docx2pdf:", bool(DOCX2PDF_AVAILABLE))
-        st.write("win32com:", bool(WIN32COM_AVAILABLE))
-        st.write("LibreOffice on PATH:", bool(find_executable(["soffice", "libreoffice"])) )
-        st.write("Log file:", LOGFILE)
-        if st.button("Show log tail", key="show_log"):
-            try:
-                with open(LOGFILE, "r", encoding="utf-8") as lf:
-                    st.code(lf.read()[-4000:])
-            except Exception as e:
-                st.error(f"Could not read log file: {e}")
-
-# --------- Reworked Print Manager (multi-file + raw_stream) ----------
-HOST_DEFAULT = "127.0.0.1"
-PORT_DEFAULT = 9999
-TIMEOUT_SECONDS = 20
-
-# Session keys for print manager
-if "sock" not in st.session_state:
-    st.session_state["sock"] = None
+# Session keys for print manager state
 if "payinfo" not in st.session_state:
     st.session_state["payinfo"] = None
 if "status" not in st.session_state:
@@ -615,187 +778,34 @@ if "user_id" not in st.session_state:
     st.session_state["user_id"] = str(uuid.uuid4())[:8]
 if "print_ack" not in st.session_state:
     st.session_state["print_ack"] = None
+if "job_listener" not in st.session_state:
+    st.session_state["job_listener"] = None
+if "current_job_id" not in st.session_state:
+    st.session_state["current_job_id"] = None
 
 def set_status(s):
     st.session_state["status"] = f"{datetime.datetime.now().strftime('%H:%M:%S')} - {s}"
 
-def close_sock():
-    sock = st.session_state.get("sock")
-    if sock:
-        try:
-            sock.close()
-        except Exception:
-            pass
-    st.session_state["sock"] = None
-    set_status("Connection closed")
-
 def generate_upi_uri(upi_id, amount, note=None):
-    params = [f"pa={upi_id}", f"am={amount}"]
+    from urllib.parse import quote_plus
+    params = [f"pa={quote_plus(upi_id)}", f"am={quote_plus(str(amount))}"]
     if note:
-        params.append(f"tn={note}")
+        params.append(f"tn={quote_plus(note)}")
     return "upi://pay?" + "&".join(params)
-
-# background listener
-def _listen_for_final_ack(sock, order_id, timeout=60):
-    try:
-        sock.settimeout(1.0)
-        buf = bytearray()
-        start = time.time()
-        while time.time() - start < timeout:
-            try:
-                b = sock.recv(1)
-                if not b:
-                    break
-                buf.extend(b)
-                if b == b"\n":
-                    try:
-                        msg = json.loads(buf.decode("utf-8", errors="ignore").strip())
-                    except Exception:
-                        buf = bytearray()
-                        continue
-                    if isinstance(msg, dict) and msg.get("order_id") == order_id:
-                        st.session_state["print_ack"] = msg
-                        set_status(f"Final ack received: {msg.get('status')}")
-                        return
-                    buf = bytearray()
-            except socket.timeout:
-                pass
-        set_status("No final ack received within timeout.")
-    except Exception as e:
-        set_status(f"Error listening for final ack: {e}")
-    finally:
-        try:
-            sock.close()
-        except Exception:
-            pass
-        st.session_state["sock"] = None
-
-def send_multiple_files(converted_files: List[ConvertedFile], copies: int, color_mode: str):
-    if not converted_files:
-        st.error("No files selected to send.")
-        return
-
-    set_status("Connecting to print server...")
-    try:
-        sock = socket.create_connection((HOST_DEFAULT, PORT_DEFAULT), timeout=15)
-        sock.settimeout(None)
-        st.session_state["sock"] = sock
-
-        job_id = str(uuid.uuid4())[:12]
-        files_meta = []
-        total_bytes = 0
-        for cf in converted_files:
-            blob = cf.pdf_bytes if cf.pdf_bytes else (cf.original_bytes or b"")
-            size = len(blob)
-            # USE helper to count pages correctly
-            pages = count_pdf_pages(blob)
-            file_id = str(uuid.uuid4())[:8]
-            files_meta.append({
-                "file_id": file_id,
-                "filename": cf.pdf_name,
-                "orig_filename": cf.orig_name,
-                "size_bytes": size,
-                "pages": pages,
-                "settings": {
-                    "copies": copies,
-                    "duplex": cf.settings.duplex,
-                    "colorMode": color_mode,
-                    "paperSize": cf.settings.paper_size,
-                    "orientation": cf.settings.orientation,
-                    "collate": cf.settings.collate
-                },
-                "will_send_converted": bool(cf.pdf_bytes)
-            })
-            total_bytes += size
-
-        metadata = {
-            "job_id": job_id,
-            "file_count": len(files_meta),
-            "total_size_bytes": total_bytes,
-            "files": files_meta,
-            "user_name": st.session_state.get("user_name") or "",
-            "user_id": st.session_state.get("user_id"),
-            "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "transfer_mode": "raw_stream"
-        }
-
-        json_line = json.dumps(metadata, separators=(",", ":"), ensure_ascii=False) + "\n"
-        sock.sendall(json_line.encode("utf-8"))
-        set_status("Metadata sent. Streaming files...")
-
-        for cf_meta in files_meta:
-            matching = next((c for c in converted_files if (c.pdf_name == cf_meta["filename"] and c.orig_name == cf_meta["orig_filename"])), None)
-            if not matching:
-                continue
-            blob = matching.pdf_bytes if matching.pdf_bytes else (matching.original_bytes or b"")
-            if blob:
-                sock.sendall(blob)
-
-        try:
-            sock.shutdown(socket.SHUT_WR)
-        except Exception:
-            pass
-
-        set_status(f"Job '{job_id}' uploaded successfully ({total_bytes} bytes). Waiting for payment info...")
-
-        sock.settimeout(TIMEOUT_SECONDS)
-        recv_buf = bytearray()
-        try:
-            while True:
-                b = sock.recv(1)
-                if not b:
-                    break
-                recv_buf.extend(b)
-                if b == b"\n" or len(recv_buf) > 200*1024:
-                    break
-        except socket.timeout:
-            st.error("Timeout waiting for payment information")
-            set_status("Payment info timeout")
-            close_sock()
-            return
-        except Exception as e:
-            st.error(f"Error receiving payment info: {e}")
-            close_sock()
-            return
-
-        if not recv_buf:
-            st.warning("No payment information received from server")
-            set_status("No payment info received")
-            close_sock()
-            return
-
-        try:
-            payinfo = json.loads(recv_buf.decode("utf-8", errors="ignore").strip())
-            st.session_state["payinfo"] = payinfo
-            set_status("Payment information received")
-            order_id = payinfo.get("order_id")
-            if order_id:
-                listener_thread = threading.Thread(target=_listen_for_final_ack, args=(sock, order_id, 120), daemon=True)
-                listener_thread.start()
-            else:
-                close_sock()
-            return
-        except Exception as e:
-            st.error(f"Invalid payment information received: {e}")
-            set_status("Invalid payment info")
-            close_sock()
-            return
-
-    except Exception as e:
-        st.error(f"Upload failed: {e}")
-        set_status("Upload failed")
-        close_sock()
 
 def pay_offline():
     payinfo = st.session_state.get("payinfo", {})
     amount = payinfo.get("amount", 0)
     currency = payinfo.get("currency", "INR")
-    close_sock()
+    set_status("Payment completed (offline).")
     st.success(f"💵 **Please pay ₹{amount} {currency} offline**")
     st.success("✅ **Thank you for using our service!**")
     st.balloons()
     st.session_state["payinfo"] = None
     st.session_state["process_complete"] = True
+    # stop listener if any
+    detach_job_listener()
+    st.session_state["current_job_id"] = None
 
 def pay_online():
     payinfo = st.session_state.get("payinfo", {})
@@ -824,18 +834,100 @@ def pay_online():
     st.info("📱 **You will be redirected to your payment app. Complete the payment there.**")
     st.success("✅ **Thank you for using our service!**")
     st.balloons()
-    close_sock()
+    # keep listener active to watch for final ack
     st.session_state["payinfo"] = None
     st.session_state["process_complete"] = True
 
 def cancel_payment():
-    close_sock()
-    st.session_state["payinfo"] = None
     set_status("Cancelled by user")
+    # detach listener
+    detach_job_listener()
+    st.session_state["payinfo"] = None
+    st.session_state["current_job_id"] = None
+
+# Attach Firestore job listener when job created
+def start_job_listener(job_id: str):
+    # detach old
+    detach_job_listener()
+    st.session_state["current_job_id"] = job_id
+    attach_job_listener(job_id)
+    set_status(f"Listening for job updates: {job_id}")
+
+# Process ACK_QUEUE into session_state (must be called in main UI thread)
+def process_ack_queue():
+    changed = False
+    try:
+        while True:
+            typ, payload = ACK_QUEUE.get_nowait()
+            if typ == "payinfo":
+                st.session_state["payinfo"] = payload
+                set_status("Payment information received (Firestore).")
+                changed = True
+            elif typ == "ack":
+                # final print ack for single order
+                st.session_state["print_ack"] = payload
+                set_status(f"Print result: {payload.get('status')}")
+                changed = True
+            elif typ == "status":
+                # job-level status update
+                st.session_state["status"] = f"{datetime.datetime.now().strftime('%H:%M:%S')} - Job {payload.get('job_id')} status: {payload.get('status')}"
+                changed = True
+    except queue.Empty:
+        pass
+    return changed
+
+# --------- Print Manager (UI unchanged except using Firestore sender) ----------
+def send_multiple_files_firestore(converted_files: List[ConvertedFile], copies: int, color_mode: str):
+    """
+    Prepares files and uploads to Firestore (per-file chunks + job manifest).
+    Then attaches a listener on the job manifest for payinfo and final ACKs.
+    """
+    if not converted_files:
+        st.error("No files selected to send.")
+        return
+
+    set_status("Preparing upload to Firestore...")
+    files_payload = []
+    total_bytes = 0
+    for cf in converted_files:
+        blob = cf.pdf_bytes if cf.pdf_bytes else (cf.original_bytes or b"")
+        size = len(blob)
+        pages = count_pdf_pages(blob)
+        settings = {
+            "copies": copies,
+            "duplex": cf.settings.duplex,
+            "colorMode": color_mode,
+            "paperSize": cf.settings.paper_size,
+            "orientation": cf.settings.orientation,
+            "collate": cf.settings.collate
+        }
+        files_payload.append({
+            "file_bytes": blob,
+            "file_name": cf.pdf_name,
+            "pages": pages,
+            "settings": settings
+        })
+        total_bytes += size
+
+    try:
+        job_id = send_job_to_firestore(files_payload, user_name=st.session_state.get("user_name", ""), user_id=st.session_state.get("user_id", ""))
+        set_status(f"Job uploaded to Firestore: {job_id}")
+        st.success(f"Job created: {job_id}")
+        start_job_listener(job_id)
+        st.session_state["payinfo"] = None
+        st.session_state["print_ack"] = None
+    except Exception as e:
+        st.error(f"Upload failed: {e}")
+        set_status("Upload failed")
+        logger.debug(traceback.format_exc())
+        return
 
 # Render Print Manager page
 def render_print_manager_page():
-    st.header("📄 File Transfer & Print Service (Multi-file)")
+    # first process any queued ACK messages
+    process_ack_queue()
+
+    st.header("📄 File Transfer & Print Service (Multi-file) — Firestore Sender")
     st.write("Upload files (multiple). Each is converted to PDF (best-effort) and stored. Select which files to send together as one job.")
 
     # user info
@@ -931,15 +1023,21 @@ def render_print_manager_page():
             if not selected_files:
                 st.error("No files selected.")
             else:
-                send_multiple_files(selected_files, copies, color_mode)
+                # New Firestore-based sender
+                send_multiple_files_firestore(selected_files, copies, color_mode)
 
     # status & payment
     if st.session_state.get("status"):
         st.info(f"📊 **Status:** {st.session_state['status']}")
 
+    # process ACK queue to refresh payinfo/acks if any (do it again here so UI updates promptly)
+    process_ack_queue()
+
     if st.session_state.get("print_ack"):
         ack = st.session_state["print_ack"]
         st.success(f"🖨️ Print result: {ack.get('status')} — {ack.get('note','')}")
+        # after showing, optionally detach listener
+        # detach_job_listener()
 
     payinfo = st.session_state.get("payinfo")
     if payinfo and not st.session_state.get("process_complete"):
@@ -969,6 +1067,7 @@ def render_print_manager_page():
             st.session_state["payinfo"] = None
             st.session_state["status"] = ""
             st.session_state["print_ack"] = None
+            st.session_state["current_job_id"] = None
             st.session_state["user_id"] = str(uuid.uuid4())[:8]
             set_status("Ready for new transfer")
 
@@ -1041,11 +1140,13 @@ def render_convert_page():
 
 # Main
 def main():
+    # main sidebar page already defined earlier
+    page = st.sidebar.radio("Page", ["Print Manager", "Convert & Format"], index=0)
     if page == "Print Manager":
         render_print_manager_page()
     else:
         render_convert_page()
-    st.markdown("<div style='text-align:center;color:#666;padding-top:6px;'>Autoprint — Clean & Mobile-Friendly</div>", unsafe_allow_html=True)
+    st.markdown("<div style='text-align:center;color:#666;padding-top:6px;'>Autoprint — Firestore Sender</div>", unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
