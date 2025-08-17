@@ -1,4 +1,3 @@
-
 # wo3_autoprint_firestore_sender.py — Full upgraded Streamlit sender (complete)
 # Run: streamlit run wo3_autoprint_firestore_sender.py
 
@@ -27,6 +26,7 @@ import threading
 import io
 import queue
 import zlib
+from urllib.parse import quote_plus
 
 # Firebase
 import firebase_admin
@@ -760,6 +760,254 @@ def detach_file_listeners():
             pass
     st.session_state["file_listeners"] = {}
 
+# --------- Enhanced Payment Functions ----------
+def validate_payment_info(payinfo: dict) -> bool:
+    """Validate that payinfo contains required UPI ID and amount"""
+    if not payinfo:
+        return False
+    
+    upi_id = payinfo.get("owner_upi", "").strip()
+    amount = payinfo.get("amount", 0)
+    
+    # Validate UPI ID format (basic check)
+    if not upi_id or "@" not in upi_id:
+        return False
+    
+    # Validate amount
+    try:
+        amount = float(amount)
+        if amount <= 0:
+            return False
+    except (ValueError, TypeError):
+        return False
+    
+    return True
+
+def generate_upi_uri(upi_id: str, amount: float, note: str = None) -> str:
+    """Generate UPI payment URI"""
+    params = [
+        f"pa={quote_plus(upi_id)}", 
+        f"am={quote_plus(str(amount))}"
+    ]
+    if note:
+        params.append(f"tn={quote_plus(note)}")
+    return "upi://pay?" + "&".join(params)
+
+def show_payment_ui(payinfo: dict):
+    """Enhanced payment UI with proper validation and flow"""
+    if not validate_payment_info(payinfo):
+        st.error("❌ **Invalid payment information received**")
+        st.write("Please contact support or try again.")
+        if st.button("🔄 Cancel & Retry"):
+            cancel_payment()
+        return
+
+    # Extract payment details
+    upi_id = payinfo.get("owner_upi", "")
+    amount = float(payinfo.get("amount", 0))
+    currency = payinfo.get("currency", "INR")
+    file_name = payinfo.get("file_name", "Print Job")
+    pages = payinfo.get("pages", "N/A")
+    copies = payinfo.get("copies", 1)
+    order_id = payinfo.get("order_id", "")
+
+    st.markdown("---")
+    st.markdown("## 💳 **Payment Required**")
+    
+    # Payment details in a nice layout
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("### 📄 **Job Details**")
+        st.write(f"**📁 File:** {file_name}")
+        st.write(f"**📑 Pages:** {pages}")
+        st.write(f"**📇 Copies:** {copies}")
+    
+    with col2:
+        st.markdown("### 💰 **Payment Details**")
+        st.write(f"**💵 Amount:** ₹{amount:.2f} {currency}")
+        st.write(f"**🔢 Order ID:** {order_id}")
+        st.write(f"**💳 UPI ID:** {upi_id}")
+
+    st.markdown("---")
+    st.markdown("### 🎯 **Choose Payment Method**")
+    
+    # Payment method buttons
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("#### 📱 **Pay Online (Recommended)**")
+        st.write("• Instant payment via UPI apps")
+        st.write("• Automatic confirmation")
+        st.write("• QR code available")
+        
+        if st.button("💳 **Pay Online**", type="primary", use_container_width=True, key="enhanced_pay_online"):
+            handle_online_payment(upi_id, amount, file_name)
+    
+    with col2:
+        st.markdown("#### 💵 **Pay Offline**")
+        st.write("• Pay directly to the shop owner")
+        st.write("• Manual confirmation required")
+        st.write("• Cash or other methods")
+        
+        if st.button("💵 **Pay Offline**", use_container_width=True, key="enhanced_pay_offline"):
+            handle_offline_payment(amount, currency)
+
+    # Cancel option
+    st.markdown("---")
+    col1, col2, col3 = st.columns([1,1,1])
+    with col2:
+        if st.button("❌ **Cancel Payment**", key="enhanced_cancel_payment"):
+            cancel_payment()
+
+def handle_online_payment(upi_id: str, amount: float, file_name: str):
+    """Handle online UPI payment with enhanced UI"""
+    # Generate UPI URI
+    upi_uri = generate_upi_uri(upi_id, amount, note=f"Print: {file_name}")
+    
+    # Mark payment attempt in Firestore
+    mark_payment_attempt("upi_intent")
+    
+    # Show payment interface
+    st.markdown("### 📱 **Complete UPI Payment**")
+    
+    # Payment button with URI
+    st.markdown(f"""
+    <div style="text-align: center; padding: 20px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border-radius: 10px; margin: 10px 0;">
+        <h3 style="color: white; margin-bottom: 15px;">💳 Pay ₹{amount:.2f}</h3>
+        <a href="{upi_uri}" target="_blank" style="display: inline-block; padding: 12px 30px; background: white; color: #667eea; text-decoration: none; border-radius: 25px; font-weight: bold; box-shadow: 0 4px 15px rgba(0,0,0,0.2);">
+            🚀 Open Payment App
+        </a>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # QR Code if available
+    if QR_AVAILABLE:
+        try:
+            col1, col2, col3 = st.columns([1,2,1])
+            with col2:
+                qr = qrcode.QRCode(version=1, box_size=8, border=2)
+                qr.add_data(upi_uri)
+                qr.make(fit=True)
+                
+                img = qr.make_image(fill_color="black", back_color="white")
+                st.image(img, caption="📱 Scan with any UPI app (GPay, PhonePe, Paytm, etc.)", use_container_width=False)
+        except Exception as e:
+            log(f"QR code generation failed: {e}", "warning")
+    
+    # Auto-open payment app
+    try:
+        webbrowser.open(upi_uri)
+    except Exception:
+        pass
+    
+    # Payment status
+    st.info("🕐 **Payment in progress...**")
+    st.markdown("""
+    **📋 Instructions:**
+    1. 📱 Click "Open Payment App" or scan the QR code
+    2. 💳 Complete the payment in your UPI app
+    3. ⏳ Wait for automatic confirmation (usually takes a few seconds)
+    4. ✅ You'll see a success message once confirmed
+    """)
+    
+    # Set waiting state
+    st.session_state["waiting_for_payment"] = True
+    st.session_state["process_complete"] = False
+
+def handle_offline_payment(amount: float, currency: str):
+    """Handle offline payment with enhanced confirmation"""
+    # Mark offline payment in Firestore
+    mark_payment_attempt("offline")
+    mark_payment_completed("offline")
+    
+    # Show success message
+    st.balloons()
+    
+    st.markdown(f"""
+    <div style="text-align: center; padding: 30px; background: linear-gradient(135deg, #4CAF50 0%, #45a049 100%); border-radius: 15px; color: white; margin: 20px 0;">
+        <h2>🎉 Payment Confirmed!</h2>
+        <h3>💵 Please pay ₹{amount:.2f} {currency} to the shop owner</h3>
+        <p style="font-size: 18px; margin: 15px 0;">✅ Your print job is now queued for processing</p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    st.success("✅ **Thank you for using our service!**")
+    st.markdown("""
+    ### 📝 **Next Steps:**
+    - 💰 Pay the shop owner directly
+    - 🖨️ Your files will be printed shortly
+    - 📞 Contact the shop if you have any questions
+    """)
+    
+    # Complete the process
+    complete_payment_process()
+
+def mark_payment_attempt(method: str):
+    """Mark payment attempt in Firestore for all current files"""
+    job_file_ids = st.session_state.get("current_file_ids", [])
+    user_id = st.session_state.get("user_id", "")
+    
+    for fid in job_file_ids:
+        try:
+            db.collection(COLLECTION).document(f"{fid}_meta").update({
+                "payment_attempted_by": user_id,
+                "payment_attempt_time": firestore.SERVER_TIMESTAMP,
+                "payment_method": method
+            })
+        except Exception as e:
+            log(f"Failed to mark payment attempt for {fid}: {e}", "warning")
+
+def mark_payment_completed(method: str):
+    """Mark payment as completed in Firestore"""
+    job_file_ids = st.session_state.get("current_file_ids", [])
+    user_id = st.session_state.get("user_id", "")
+    
+    for fid in job_file_ids:
+        try:
+            db.collection(COLLECTION).document(f"{fid}_meta").update({
+                "payment_confirmed_by": user_id,
+                "payment_method": method,
+                "payment_time": firestore.SERVER_TIMESTAMP,
+                "payment_received": True,
+                "payment_status": "completed"
+            })
+        except Exception as e:
+            log(f"Failed to mark payment completion for {fid}: {e}", "warning")
+
+def complete_payment_process():
+    """Complete the payment process and clean up"""
+    set_status("Payment process completed successfully")
+    
+    # Update session state
+    st.session_state["payinfo"] = None
+    st.session_state["process_complete"] = True
+    st.session_state["waiting_for_payment"] = False
+    
+    # Clean up listeners
+    detach_file_listeners()
+    detach_job_listener()
+    
+    # Clear job references
+    st.session_state["current_job_id"] = None
+    st.session_state["current_file_ids"] = []
+
+def cancel_payment():
+    """Cancel the payment process"""
+    set_status("Payment cancelled by user")
+    
+    # Clean up listeners
+    detach_job_listener()
+    detach_file_listeners()
+    
+    # Reset session state
+    st.session_state["payinfo"] = None
+    st.session_state["current_job_id"] = None
+    st.session_state["current_file_ids"] = []
+    st.session_state["waiting_for_payment"] = False
+    st.session_state["process_complete"] = False
+    
+    st.warning("Payment cancelled. You can start a new print job.")
+
 # --------- Streamlit UI initialization keys ----------
 if 'converted_files_pm' not in st.session_state:
     st.session_state.converted_files_pm = []
@@ -794,93 +1042,6 @@ if "file_listeners" not in st.session_state:
 def set_status(s):
     st.session_state["status"] = f"{datetime.datetime.now().strftime('%H:%M:%S')} - {s}"
 
-def generate_upi_uri(upi_id, amount, note=None):
-    from urllib.parse import quote_plus
-    params = [f"pa={quote_plus(upi_id)}", f"am={quote_plus(str(amount))}"]
-    if note:
-        params.append(f"tn={quote_plus(note)}")
-    return "upi://pay?" + "&".join(params)
-
-# Payment handlers
-def pay_offline():
-    payinfo = st.session_state.get("payinfo", {}) or {}
-    amount = payinfo.get("amount", 0)
-    currency = payinfo.get("currency", "INR")
-    job_file_ids = st.session_state.get("current_file_ids", []) or []
-    # Mark offline payment on each file manifest
-    for fid in job_file_ids:
-        try:
-            db.collection(COLLECTION).document(f"{fid}_meta").update({
-                "payment_confirmed_by": st.session_state.get("user_id"),
-                "payment_method": "offline",
-                "payment_time": firestore.SERVER_TIMESTAMP,
-                "payment_received": True
-            })
-        except Exception:
-            logger.debug("Failed updating offline payment to file meta:\n" + traceback.format_exc())
-    set_status("Payment completed (offline).")
-    st.success(f"💵 **Please pay ₹{amount} {currency} offline — marked as 'offline paid'**")
-    st.success("✅ **Thank you for using our service!**")
-    st.balloons()
-    st.session_state["payinfo"] = None
-    st.session_state["process_complete"] = True
-    st.session_state["waiting_for_payment"] = False
-    detach_file_listeners()
-    st.session_state["current_job_id"] = None
-    st.session_state["current_file_ids"] = []
-
-def pay_online():
-    payinfo = st.session_state.get("payinfo", {}) or {}
-    owner_upi = payinfo.get("owner_upi")
-    if not owner_upi:
-        st.error("Payment information not available")
-        return
-    amount = payinfo.get("amount", 0)
-    file_name = payinfo.get("file_name", "Print Job")
-    upi_uri = generate_upi_uri(owner_upi, amount, note=f"Print: {file_name}")
-
-    # Mark payment attempt on each file meta
-    job_file_ids = st.session_state.get("current_file_ids", []) or []
-    for fid in job_file_ids:
-        try:
-            db.collection(COLLECTION).document(f"{fid}_meta").update({
-                "payment_attempted_by": st.session_state.get("user_id"),
-                "payment_attempt_time": firestore.SERVER_TIMESTAMP,
-                "payment_method": "upi_intent"
-            })
-        except Exception:
-            logger.debug("Failed updating payment attempt to file meta:\n" + traceback.format_exc())
-
-    # Open UPI URI and show QR if available
-    st.markdown(f"**💳 Pay ₹{amount} via UPI**")
-    st.markdown(f"[🚀 **Open Payment App**]({upi_uri})")
-    if QR_AVAILABLE:
-        try:
-            qr = qrcode.QRCode(box_size=6, border=2)
-            qr.add_data(upi_uri)
-            qr.make(fit=True)
-            img = qr.make_image(fill_color="black", back_color="white")
-            st.image(img, width=200, caption="Scan with any UPI app")
-        except Exception:
-            pass
-    try:
-        webbrowser.open(upi_uri)
-    except Exception:
-        pass
-
-    st.info("📱 **You will be redirected to your payment app. Complete the payment there.**\n\nWaiting for confirmation from the printing receiver...")
-    st.session_state["waiting_for_payment"] = True
-    st.session_state["process_complete"] = False
-    # Keep the payinfo visible until the receiver confirms (receiver should set payinfo.paid or payment_received)
-
-def cancel_payment():
-    set_status("Cancelled by user")
-    detach_job_listener()
-    detach_file_listeners()
-    st.session_state["payinfo"] = None
-    st.session_state["current_job_id"] = None
-    st.session_state["waiting_for_payment"] = False
-
 # Attach job listener
 def start_job_listener(job_id: str):
     detach_job_listener()
@@ -888,7 +1049,7 @@ def start_job_listener(job_id: str):
     attach_job_listener(job_id)
     set_status(f"Listening for job updates: {job_id}")
 
-# Process ACK_QUEUE into session_state
+# Process ACK_QUEUE into session_state with enhanced handling
 def process_ack_queue():
     changed = False
     try:
@@ -896,33 +1057,29 @@ def process_ack_queue():
             typ, payload = ACK_QUEUE.get_nowait()
             if typ == "payinfo":
                 st.session_state["payinfo"] = payload
-                set_status("Payment information received (Firestore).")
+                set_status("Payment information received from printer")
                 changed = True
             elif typ == "ack":
                 st.session_state["print_ack"] = payload
-                set_status(f"Print result: {payload.get('status')}")
+                set_status(f"Print completed: {payload.get('status', 'unknown')}")
                 changed = True
             elif typ == "status":
-                st.session_state["status"] = f"{datetime.datetime.now().strftime('%H:%M:%S')} - Job {payload.get('job_id')} status: {payload.get('status')}"
+                job_id = payload.get('job_id', '')
+                status = payload.get('status', '')
+                st.session_state["status"] = f"{datetime.datetime.now().strftime('%H:%M:%S')} - Job {job_id[:8]}... status: {status}"
                 changed = True
             elif typ == "payment":
-                # any payment confirmation
-                set_status("Payment confirmed via Firestore.")
-                st.success("✅ Payment confirmed — thank you!")
+                # Payment confirmed by receiver
+                set_status("Payment confirmed by printer!")
+                st.success("✅ **Payment confirmed - thank you!**")
                 st.balloons()
-                st.session_state["payinfo"] = None
-                st.session_state["process_complete"] = True
-                st.session_state["waiting_for_payment"] = False
-                try:
-                    detach_job_listener()
-                except Exception:
-                    pass
+                complete_payment_process()
                 changed = True
     except queue.Empty:
         pass
     return changed
 
-# send_multiple_files_firestore
+# send_multiple_files_firestore (unchanged)
 def send_multiple_files_firestore(converted_files: List[ConvertedFile], copies: int, color_mode: str):
     if not converted_files:
         st.error("No files selected to send.")
@@ -953,97 +1110,134 @@ def send_multiple_files_firestore(converted_files: List[ConvertedFile], copies: 
 
     try:
         job_id, job_files = send_job_to_firestore(files_payload, user_name=st.session_state.get("user_name", ""), user_id=st.session_state.get("user_id", ""))
-        set_status(f"Job uploaded to Firestore: {job_id}")
-        st.success(f"Job created: {job_id}")
-        # record job and file ids in session so payment actions can reference them
+        set_status(f"Job uploaded successfully: {job_id}")
+        st.success(f"✅ **Print job created:** `{job_id}`")
+        
+        # Record job and file ids in session so payment actions can reference them
         st.session_state["current_job_id"] = job_id
         st.session_state["current_file_ids"] = [f["file_id"] for f in job_files]
-        # attach a listener to the job meta and to each file meta
+        
+        # Attach listeners to job and file metadata
         start_job_listener(job_id)
         for f in job_files:
             try:
                 attach_file_listener(f["file_id"])
             except Exception:
                 logger.debug("attach_file_listener error:\n" + traceback.format_exc())
+        
+        # Reset payment-related state
         st.session_state["payinfo"] = None
         st.session_state["print_ack"] = None
         st.session_state["process_complete"] = False
         st.session_state["waiting_for_payment"] = False
+        
     except Exception as e:
-        st.error(f"Upload failed: {e}")
+        st.error(f"❌ Upload failed: {e}")
         set_status("Upload failed")
         logger.debug(traceback.format_exc())
         return
 
-# ---------------- Streamlit UI ----------------
-st.set_page_config(page_title="Autoprint (Firestore Sender)", layout="wide", page_icon="🖨️", initial_sidebar_state="expanded")
+# ---------------- Enhanced Streamlit UI ----------------
+st.set_page_config(
+    page_title="Autoprint (Firestore Sender)", 
+    layout="wide", 
+    page_icon="🖨️", 
+    initial_sidebar_state="expanded"
+)
 
 st.markdown(
     """
     <style>
       .appview-container .main .block-container {padding-top: 10px; padding-bottom:10px;}
-      .stButton>button {padding:6px 10px;}
-      .stDownloadButton>button {padding:6px 10px;}
-      .stProgress {height:14px;}
+      .stButton>button {padding:8px 12px; font-weight: 500;}
+      .stDownloadButton>button {padding:8px 12px;}
+      .stProgress {height:16px;}
+      
+      /* Enhanced payment UI styles */
+      .payment-card {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        padding: 20px;
+        border-radius: 15px;
+        color: white;
+        text-align: center;
+        margin: 15px 0;
+      }
+      
+      .success-card {
+        background: linear-gradient(135deg, #4CAF50 0%, #45a049 100%);
+        padding: 20px;
+        border-radius: 15px;
+        color: white;
+        text-align: center;
+        margin: 15px 0;
+      }
     </style>
     """,
     unsafe_allow_html=True
 )
 
-st.markdown("<h1 style='text-align:center;margin:6px 0 8px 0;'>Autoprint (Firestore Sender)</h1>", unsafe_allow_html=True)
+st.markdown("<h1 style='text-align:center;margin:6px 0 8px 0;'>🖨️ Autoprint Service</h1>", unsafe_allow_html=True)
+st.markdown("<p style='text-align:center;color:#666;'>Professional Document Printing with UPI Payment Integration</p>", unsafe_allow_html=True)
 
-st.markdown(
-    """
-    <div style="display:flex;align-items:center;gap:10px;padding:8px;border-radius:6px;background:#f1f7ff;">
-      <strong style="font-size:13px;">Tip:</strong>
-      <span style="font-size:13px;">
-        Use the Convert & Format page to prepare PDFs. Use this page to upload selected files to Firestore,
-        which the printing receiver watches and processes.
-      </span>
-    </div>
-    """,
-    unsafe_allow_html=True
-)
-
-# Render Print Manager page
+# Render Print Manager page with enhanced UI
 def render_print_manager_page():
-    # Auto-refresh: prefer streamlit-autorefresh; fallback to JS reload while a job is active.
+    # Auto-refresh functionality
     if AUTORELOAD_AVAILABLE:
-        st_autorefresh(interval=2000, key="auto_refresh_sender")  # 2s
+        st_autorefresh(interval=2000, key="auto_refresh_sender", limit=1000)
     else:
-        # If a job is active or waiting for payment, reload page every 2.5s using JS
+        # Fallback refresh for active jobs
         if st.session_state.get("current_job_id") or st.session_state.get("waiting_for_payment"):
             js = """
             <script>
-              // reload only if page is visible (avoid aggressive reload when in background)
               function reloadIfVisible() {
                 if (document.visibilityState === 'visible') {
                   window.location.reload();
                 }
               }
-              setInterval(reloadIfVisible, 2500);
+              setInterval(reloadIfVisible, 3000);
             </script>
             """
             components.html(js, height=0)
 
-    # process ACK_QUEUE each run
+    # Process real-time updates
     process_ack_queue()
 
-    st.header("📄 File Transfer & Print Service (Multi-file) — Firestore Sender")
-    st.write("Upload files (multiple). Each is converted to PDF (best-effort) and stored. Select which files to send together as one job.")
+    st.header("📄 Print Service Dashboard")
+    
+    # Show current status if active
+    if st.session_state.get("status"):
+        if st.session_state.get("waiting_for_payment"):
+            st.info(f"🕐 **Status:** {st.session_state['status']} - Waiting for payment confirmation...")
+        else:
+            st.info(f"📊 **Status:** {st.session_state['status']}")
 
-    # user info
+    # User information section
     st.markdown("### 👤 User Information")
-    user_name = st.text_input("Your name (optional)", value=st.session_state.get("user_name", ""), placeholder="Enter your name for print identification", help="This helps identify your print job at the printer")
+    user_name = st.text_input(
+        "Your name (optional)", 
+        value=st.session_state.get("user_name", ""), 
+        placeholder="Enter your name for print identification", 
+        help="This helps identify your print job at the printer"
+    )
     if user_name != st.session_state.get("user_name", ""):
         st.session_state["user_name"] = user_name
-    st.caption(f"Your ID: **{st.session_state['user_id']}** (auto-generated)")
+    
+    st.caption(f"🆔 **Your ID:** `{st.session_state['user_id']}` (auto-generated)")
 
-    # multi-upload
-    uploaded = st.file_uploader("📁 Upload files to add to queue (multiple)", accept_multiple_files=True, type=['pdf','txt','md','rtf','html','htm','png','jpg','jpeg','bmp','tiff','webp','docx','pptx'], key="pm_multi_upload")
+    # File upload section
+    st.markdown("### 📁 Upload Files")
+    uploaded = st.file_uploader(
+        "Select files to print (supports PDF, Word, PowerPoint, images, text files)", 
+        accept_multiple_files=True, 
+        type=['pdf','txt','md','rtf','html','htm','png','jpg','jpeg','bmp','tiff','webp','docx','pptx'], 
+        key="pm_multi_upload"
+    )
+    
     if uploaded:
-        with st.spinner("Converting and storing..."):
+        with st.spinner("🔄 Converting files to PDF..."):
             conv_list = st.session_state.get("converted_files_pm", [])
+            new_files = 0
+            
             for uf in uploaded:
                 if any(x.orig_name == uf.name for x in conv_list):
                     continue
@@ -1051,120 +1245,146 @@ def render_print_manager_page():
                     original_bytes = uf.getvalue()
                     pdf_bytes = FileConverter.convert_uploaded_file_to_pdf_bytes(uf)
                     if pdf_bytes:
-                        cf = ConvertedFile(orig_name=uf.name, pdf_name=os.path.splitext(uf.name)[0] + ".pdf", pdf_bytes=pdf_bytes, settings=PrintSettings(), original_bytes=original_bytes)
+                        cf = ConvertedFile(
+                            orig_name=uf.name, 
+                            pdf_name=os.path.splitext(uf.name)[0] + ".pdf", 
+                            pdf_bytes=pdf_bytes, 
+                            settings=PrintSettings(), 
+                            original_bytes=original_bytes
+                        )
                     else:
-                        cf = ConvertedFile(orig_name=uf.name, pdf_name=uf.name, pdf_bytes=b"", settings=PrintSettings(), original_bytes=original_bytes)
+                        cf = ConvertedFile(
+                            orig_name=uf.name, 
+                            pdf_name=uf.name, 
+                            pdf_bytes=b"", 
+                            settings=PrintSettings(), 
+                            original_bytes=original_bytes
+                        )
                     conv_list.append(cf)
+                    new_files += 1
                 except Exception as e:
-                    log(f"Conversion on upload failed for {uf.name}: {e}", "warning")
-            st.session_state.converted_files_pm = conv_list
-            st.success(f"Added {len(uploaded)} file(s). Conversion attempted where possible.")
+                    log(f"Conversion failed for {uf.name}: {e}", "warning")
+                    st.error(f"⚠️ Failed to convert {uf.name}")
+            
+            if new_files > 0:
+                st.session_state.converted_files_pm = conv_list
+                st.success(f"✅ Added {new_files} file(s) to print queue")
 
-    # queue display
-    st.subheader("📂 Files in queue")
+    # File queue display
+    st.markdown("### 📋 Print Queue")
     conv = st.session_state.get("converted_files_pm", [])
+    
     if not conv:
-        st.info("No files in queue. Upload above.")
+        st.info("📝 No files in queue. Upload files above to get started.")
     else:
+        # File list with enhanced UI
         for idx, cf in enumerate(conv):
-            cols = st.columns([4,1,1,1])
-            with cols[0]:
-                checked_key = f"sel_file_{idx}"
-                if checked_key not in st.session_state:
-                    st.session_state[checked_key] = True
-                st.checkbox(f"{cf.pdf_name} (orig: {cf.orig_name})", value=st.session_state[checked_key], key=checked_key)
-                if st.button(f"Preview {idx}", key=f"preview_pm_{idx}"):
+            with st.expander(f"📄 {cf.pdf_name} (original: {cf.orig_name})", expanded=False):
+                cols = st.columns([3,1,1,1,1])
+                
+                with cols[0]:
+                    checked_key = f"sel_file_{idx}"
+                    if checked_key not in st.session_state:
+                        st.session_state[checked_key] = True
+                    st.checkbox("Include in print job", value=st.session_state[checked_key], key=checked_key)
+                
+                with cols[1]:
+                    if st.button("👁️ Preview", key=f"preview_pm_{idx}"):
+                        if cf.pdf_bytes:
+                            b64 = base64.b64encode(cf.pdf_bytes).decode('utf-8')
+                            ts = int(time.time()*1000)
+                            js = f"""
+                            <script>
+                            (function(){{
+                                const b64="{b64}";
+                                const bytes=atob(b64);const arr=new Uint8Array(bytes.length);
+                                for(let i=0;i<bytes.length;i++)arr[i]=bytes.charCodeAt(i);
+                                const blob=new Blob([arr],{{type:'application/pdf'}});
+                                const url=URL.createObjectURL(blob);
+                                const w=window.open(url,'preview_{ts}','width=900,height=700,scrollbars=yes,resizable=yes');
+                                if(!w)alert('Please allow popups to preview files.');
+                            }})();
+                            </script>
+                            """
+                            components.html(js, height=0)
+                        else:
+                            st.warning("⚠️ PDF preview not available")
+                
+                with cols[2]:
                     if cf.pdf_bytes:
-                        b64 = base64.b64encode(cf.pdf_bytes).decode('utf-8')
-                        ts = int(time.time()*1000)
-                        js = f"""
-                        <script>
-                        (function(){{
-                            const b64="{b64}";
-                            const bytes=atob(b64);const arr=new Uint8Array(bytes.length);
-                            for(let i=0;i<bytes.length;i++)arr[i]=bytes.charCodeAt(i);
-                            const blob=new Blob([arr],{{type:'application/pdf'}});
-                            const url=URL.createObjectURL(blob);
-                            const w=window.open(url,'pm_preview_{ts}','width=900,height=700,scrollbars=yes,resizable=yes,menubar=yes,toolbar=yes');
-                            if(!w)alert('Allow popups to preview.');
-                        }})();
-                        </script>
-                        """
-                        components.html(js, height=0)
+                        st.download_button("📥 PDF", data=cf.pdf_bytes, file_name=cf.pdf_name, mime="application/pdf", key=f"dl_{idx}")
                     else:
-                        st.warning("No converted PDF available for preview; original bytes will be sent instead.")
-            with cols[1]:
-                if st.button("Download", key=f"dl_pm_{idx}"):
-                    if cf.pdf_bytes:
-                        st.download_button("Download PDF", data=cf.pdf_bytes, file_name=cf.pdf_name, mime="application/pdf", key=f"dlpdf_{idx}")
-                    else:
-                        st.download_button("Download original", data=cf.original_bytes or b"", file_name=cf.orig_name, mime="application/octet-stream", key=f"dlorig_{idx}")
-            with cols[2]:
-                if st.button("Remove", key=f"rm_pm_{idx}"):
-                    new_list = [x for x in st.session_state.converted_files_pm if x.orig_name != cf.orig_name]
-                    st.session_state.converted_files_pm = new_list
-                    set_status(f"Removed {cf.orig_name} from queue")
-            with cols[3]:
-                blob_for_count = cf.pdf_bytes if cf.pdf_bytes else (cf.original_bytes or b'')
-                pages = count_pdf_pages(blob_for_count)
-                st.caption(f"{pages}p")
+                        st.download_button("📥 Original", data=cf.original_bytes or b"", file_name=cf.orig_name, key=f"dl_orig_{idx}")
+                
+                with cols[3]:
+                    if st.button("🗑️ Remove", key=f"rm_{idx}"):
+                        st.session_state.converted_files_pm = [x for x in conv if x.orig_name != cf.orig_name]
+                        st.rerun()
+                
+                with cols[4]:
+                    blob_for_count = cf.pdf_bytes if cf.pdf_bytes else (cf.original_bytes or b'')
+                    pages = count_pdf_pages(blob_for_count)
+                    st.metric("Pages", pages)
 
+        # Print settings and submission
         selected_files = [cf for idx,cf in enumerate(conv) if st.session_state.get(f"sel_file_{idx}", True)]
-
-        st.markdown("---")
-        st.markdown("### 🖨️ Job-level Print Settings")
-        col1, col2 = st.columns(2)
-        with col1:
-            copies = st.number_input("Number of copies (per file)", min_value=1, max_value=10, value=1, key="pm_job_copies")
-        with col2:
-            color_mode = st.selectbox("Print mode", options=["Auto", "Color", "Monochrome"], key="pm_job_colormode")
-
-        if st.button("📤 **Send Selected Files**", type="primary", use_container_width=True, key="pm_send_multi"):
-            if not selected_files:
-                st.error("No files selected.")
-            else:
+        
+        if selected_files:
+            st.markdown("---")
+            st.markdown("### ⚙️ Print Settings")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                copies = st.number_input("📑 Copies per file", min_value=1, max_value=10, value=1, key="pm_job_copies")
+            with col2:
+                color_mode = st.selectbox("🎨 Print Mode", options=["Auto", "Color", "Monochrome"], key="pm_job_colormode")
+            
+            # Calculate totals
+            total_pages = sum(count_pdf_pages(cf.pdf_bytes or cf.original_bytes or b'') for cf in selected_files)
+            total_copies = total_pages * copies
+            
+            st.info(f"📊 **Summary:** {len(selected_files)} files, {total_pages} pages, {total_copies} total pages to print")
+            
+            # Submit button
+            if st.button("🖨️ **Send Print Job**", type="primary", use_container_width=True, key="pm_send_multi"):
                 send_multiple_files_firestore(selected_files, copies, color_mode)
 
-    # status & payment processing
-    if st.session_state.get("status"):
-        st.info(f"📊 **Status:** {st.session_state['status']}")
-
-    # process ACK queue again to ensure UI updates
+    # Process any new updates
     process_ack_queue()
 
+    # Print acknowledgment display
     if st.session_state.get("print_ack"):
         ack = st.session_state["print_ack"]
-        st.success(f"🖨️ Print result: {ack.get('status')} — {ack.get('note','')}")
-        # optionally detach listeners
+        status = ack.get('status', 'unknown')
+        note = ack.get('note', '')
+        
+        if status.lower() in ['completed', 'success', 'printed']:
+            st.success(f"🎉 **Print completed successfully!** {note}")
+        elif status.lower() in ['error', 'failed']:
+            st.error(f"❌ **Print failed:** {note}")
+        else:
+            st.info(f"📄 **Print status:** {status} - {note}")
 
-    # Payment UI — appears when payinfo is present
+    # Enhanced Payment UI - main feature
     payinfo = st.session_state.get("payinfo")
     if payinfo and not st.session_state.get("process_complete"):
-        st.markdown("---")
-        st.markdown("## 💳 **Payment Required**")
-        col1, col2 = st.columns(2)
-        with col1:
-            st.write(f"**📄 File(s):** {payinfo.get('file_name', payinfo.get('filename', 'Multiple'))}")
-            st.write(f"**💰 Amount:** ₹{payinfo.get('amount', 0)} {payinfo.get('currency', 'INR')}")
-            st.write(f"**🔢 Order ID:** {payinfo.get('order_id', '')}")
-        with col2:
-            st.write(f"**📑 Pages:** {payinfo.get('pages', 'N/A')}")
-            st.write(f"**📇 Copies:** {payinfo.get('copies', 1)}")
-            st.write(f"**UPI:** {payinfo.get('owner_upi', '')}")
-        st.markdown("### Choose Payment Method:")
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("💳 **Pay Online**", type="primary", use_container_width=True, key="pm_pay_online"):
-                pay_online()
-        with col2:
-            if st.button("💵 **Pay Offline**", use_container_width=True, key="pm_pay_offline"):
-                pay_offline()
-        st.markdown("If you already paid, wait a few seconds for the receiver to confirm and update the UI automatically.")
+        show_payment_ui(payinfo)
 
+    # Process completion
     if st.session_state.get("process_complete"):
-        st.success("🎉 **Process Complete!**")
-        st.write("Thank you for using our file transfer and print service.")
-        if st.button("🔄 Start New Transfer"):
+        st.markdown("---")
+        st.markdown(
+            """
+            <div style="text-align: center; padding: 30px; background: linear-gradient(135deg, #4CAF50 0%, #45a049 100%); border-radius: 15px; color: white; margin: 20px 0;">
+                <h2>🎉 Process Complete!</h2>
+                <p style="font-size: 18px;">Thank you for using our print service</p>
+            </div>
+            """, 
+            unsafe_allow_html=True
+        )
+        
+        if st.button("🔄 **Start New Print Job**", type="primary", use_container_width=True):
+            # Reset all session state for new job
             st.session_state["process_complete"] = False
             st.session_state["payinfo"] = None
             st.session_state["status"] = ""
@@ -1173,83 +1393,243 @@ def render_print_manager_page():
             st.session_state["current_file_ids"] = []
             st.session_state["user_id"] = str(uuid.uuid4())[:8]
             st.session_state["waiting_for_payment"] = False
-            set_status("Ready for new transfer")
+            st.session_state["converted_files_pm"] = []  # Clear file queue
+            set_status("Ready for new print job")
+            st.rerun()
 
-# Convert & Format page (same as earlier)
+# Convert & Format page (enhanced)
 def render_convert_page():
-    st.header("📄 Convert & Format")
-    st.write("Batch-convert files. Converted items appear in a separate list for previewing/printing.")
+    st.header("🔄 Convert & Format Documents")
+    st.write("Batch convert documents to PDF format for printing. Converted files can be previewed and formatted before printing.")
 
-    uploaded = st.file_uploader("Upload files to convert", accept_multiple_files=True,
-                                type=['txt','md','rtf','html','htm','png','jpg','jpeg','bmp','tiff','webp','docx','pptx','pdf'],
-                                key="conv_upload")
+    # File upload for conversion
+    uploaded = st.file_uploader(
+        "📁 Upload files to convert to PDF", 
+        accept_multiple_files=True,
+        type=['txt','md','rtf','html','htm','png','jpg','jpeg','bmp','tiff','webp','docx','pptx','pdf'],
+        key="conv_upload",
+        help="Supported formats: Text files, Images, Word documents, PowerPoint presentations, and existing PDFs"
+    )
+    
     if uploaded:
-        with st.spinner("Converting..."):
+        with st.spinner("🔄 Converting files..."):
             converted = []
+            failed = []
+            
             for uf in uploaded:
-                pdf_bytes = FileConverter.convert_uploaded_file_to_pdf_bytes(uf)
-                if pdf_bytes:
-                    converted.append({
-                        "orig_name": uf.name,
-                        "pdf_name": os.path.splitext(uf.name)[0] + ".pdf",
-                        "pdf_bytes": pdf_bytes,
-                        "pdf_base64": base64.b64encode(pdf_bytes).decode('utf-8')
-                    })
-                else:
-                    st.error(f"Failed: {uf.name}")
+                try:
+                    pdf_bytes = FileConverter.convert_uploaded_file_to_pdf_bytes(uf)
+                    if pdf_bytes:
+                        converted.append({
+                            "orig_name": uf.name,
+                            "pdf_name": os.path.splitext(uf.name)[0] + ".pdf",
+                            "pdf_bytes": pdf_bytes,
+                            "pdf_base64": base64.b64encode(pdf_bytes).decode('utf-8'),
+                            "pages": count_pdf_pages(pdf_bytes),
+                            "size_mb": len(pdf_bytes) / (1024*1024)
+                        })
+                    else:
+                        failed.append(uf.name)
+                except Exception as e:
+                    failed.append(uf.name)
+                    log(f"Conversion failed for {uf.name}: {e}", "error")
+            
             if converted:
                 st.session_state.converted_files_conv = converted
-                st.success(f"Converted {len(converted)} files.")
+                st.success(f"✅ Successfully converted {len(converted)} files")
+            
+            if failed:
+                st.error(f"❌ Failed to convert {len(failed)} files: {', '.join(failed)}")
 
-    if st.session_state.converted_files_conv:
-        st.subheader("Converted Items")
-        for i, it in enumerate(st.session_state.converted_files_conv):
-            cols = st.columns([3,1,1])
-            cols[0].write(f"**{it['pdf_name']}**")
-            cols[0].caption(it['orig_name'])
-            if cols[1].button("Preview", key=f"c_preview_{i}"):
-                b64 = it['pdf_base64']; ts=int(time.time()*1000)
-                js=f"""
-                <script>
-                (function(){{
-                    const b64="{b64}";
-                    const bytes=atob(b64);const arr=new Uint8Array(bytes.length);
-                    for(let i=0;i<bytes.length;i++)arr[i]=bytes.charCodeAt(i);
-                    const blob=new Blob([arr],{{type:'application/pdf'}});
-                    const url=URL.createObjectURL(blob);
-                    const w=window.open(url,'conv_preview_{ts}','width=900,height=700,scrollbars=yes,resizable=yes,menubar=yes,toolbar=yes');
-                    if(!w)alert('Allow popups to preview.');
-                }})();
-                </script>
-                """
-                components.html(js, height=0)
-            if cols[2].button("Format & Print", key=f"c_format_{i}"):
-                b64 = it['pdf_base64']; ts=int(time.time()*1000)
-                js=f"""
-                <script>
-                (function(){{
-                  try {{
-                    const b64="{b64}";
-                    const bytes=atob(b64);const arr=new Uint8Array(bytes.length);
-                    for(let i=0;i<bytes.length;i++)arr[i]=bytes.charCodeAt(i);
-                    const blob=new Blob([arr],{{type:'application/pdf'}});
-                    const url=URL.createObjectURL(blob);
-                    const pop = window.open(url,'conv_fprint_{ts}','width=900,height=700,scrollbars=yes,resizable=yes,menubar=yes,toolbar=yes');
-                    if(pop){{ setTimeout(()=>{{ try{{ pop.print(); }}catch(e){{}} }},1200); }} else {{ alert('Allow popups for Format & Print.'); }}
-                  }} catch(e){{ alert('Error'); }}
-                }})();
-                </script>
-                """
-                components.html(js, height=0)
+    # Display converted files
+    if st.session_state.get("converted_files_conv"):
+        st.markdown("### 📄 Converted Files")
+        
+        # Summary stats
+        total_files = len(st.session_state.converted_files_conv)
+        total_pages = sum(item.get("pages", 1) for item in st.session_state.converted_files_conv)
+        total_size = sum(item.get("size_mb", 0) for item in st.session_state.converted_files_conv)
+        
+        col1, col2, col3 = st.columns(3)
+        col1.metric("📁 Files", total_files)
+        col2.metric("📑 Total Pages", total_pages)
+        col3.metric("💾 Total Size", f"{total_size:.1f} MB")
+        
+        st.markdown("---")
+        
+        # File list with actions
+        for i, item in enumerate(st.session_state.converted_files_conv):
+            with st.container():
+                col1, col2, col3, col4, col5 = st.columns([3, 1, 1, 1, 1])
+                
+                with col1:
+                    st.write(f"**📄 {item['pdf_name']}**")
+                    st.caption(f"Original: {item['orig_name']} | Pages: {item.get('pages', 1)} | Size: {item.get('size_mb', 0):.1f} MB")
+                
+                with col2:
+                    if st.button("👁️ Preview", key=f"c_preview_{i}"):
+                        b64 = item['pdf_base64']
+                        ts = int(time.time()*1000)
+                        js = f"""
+                        <script>
+                        (function(){{
+                            const b64="{b64}";
+                            const bytes=atob(b64);
+                            const arr=new Uint8Array(bytes.length);
+                            for(let i=0;i<bytes.length;i++)arr[i]=bytes.charCodeAt(i);
+                            const blob=new Blob([arr],{{type:'application/pdf'}});
+                            const url=URL.createObjectURL(blob);
+                            const w=window.open(url,'conv_preview_{ts}','width=900,height=700,scrollbars=yes,resizable=yes,menubar=yes,toolbar=yes');
+                            if(!w)alert('Please allow popups to preview files.');
+                        }})();
+                        </script>
+                        """
+                        components.html(js, height=0)
+                
+                with col3:
+                    st.download_button(
+                        "📥 Download", 
+                        data=item['pdf_bytes'], 
+                        file_name=item['pdf_name'], 
+                        mime="application/pdf",
+                        key=f"c_download_{i}"
+                    )
+                
+                with col4:
+                    if st.button("🖨️ Print", key=f"c_print_{i}"):
+                        b64 = item['pdf_base64']
+                        ts = int(time.time()*1000)
+                        js = f"""
+                        <script>
+                        (function(){{
+                          try {{
+                            const b64="{b64}";
+                            const bytes=atob(b64);
+                            const arr=new Uint8Array(bytes.length);
+                            for(let i=0;i<bytes.length;i++)arr[i]=bytes.charCodeAt(i);
+                            const blob=new Blob([arr],{{type:'application/pdf'}});
+                            const url=URL.createObjectURL(blob);
+                            const pop = window.open(url,'conv_print_{ts}','width=900,height=700,scrollbars=yes,resizable=yes,menubar=yes,toolbar=yes');
+                            if(pop){{ 
+                                setTimeout(()=>{{ 
+                                    try{{ 
+                                        pop.print(); 
+                                    }}catch(e){{
+                                        console.log('Print dialog may have been blocked');
+                                    }} 
+                                }}, 1500); 
+                            }} else {{ 
+                                alert('Please allow popups for direct printing.'); 
+                            }}
+                          }} catch(e){{ 
+                            alert('Error opening print dialog: ' + e.message); 
+                          }}
+                        }})();
+                        </script>
+                        """
+                        components.html(js, height=0)
+                
+                with col5:
+                    if st.button("🗑️ Remove", key=f"c_remove_{i}"):
+                        st.session_state.converted_files_conv.pop(i)
+                        st.rerun()
+                
+                st.markdown("---")
+        
+        # Bulk actions
+        if st.session_state.converted_files_conv:
+            st.markdown("### 🔧 Bulk Actions")
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                if st.button("📥 **Download All as ZIP**", use_container_width=True):
+                    # This would require implementing ZIP creation
+                    st.info("💡 ZIP download feature - coming soon!")
+            
+            with col2:
+                if st.button("➕ **Add All to Print Queue**", use_container_width=True):
+                    # Add all converted files to print manager queue
+                    pm_files = st.session_state.get("converted_files_pm", [])
+                    added = 0
+                    
+                    for item in st.session_state.converted_files_conv:
+                        # Check if file already exists in PM queue
+                        if not any(x.orig_name == item['orig_name'] for x in pm_files):
+                            cf = ConvertedFile(
+                                orig_name=item['orig_name'],
+                                pdf_name=item['pdf_name'],
+                                pdf_bytes=item['pdf_bytes'],
+                                settings=PrintSettings(),
+                                original_bytes=None
+                            )
+                            pm_files.append(cf)
+                            added += 1
+                    
+                    st.session_state.converted_files_pm = pm_files
+                    if added > 0:
+                        st.success(f"✅ Added {added} files to print queue")
+                    else:
+                        st.info("ℹ️ All files are already in the print queue")
+            
+            with col3:
+                if st.button("🗑️ **Clear All**", use_container_width=True):
+                    st.session_state.converted_files_conv = []
+                    st.success("🗑️ Cleared all converted files")
+                    st.rerun()
 
-# Main
+# Main application
 def main():
-    page = st.sidebar.radio("Page", ["Print Manager", "Convert & Format"], index=0)
-    if page == "Print Manager":
+    # Sidebar navigation
+    with st.sidebar:
+        st.markdown("## 🧭 Navigation")
+        page = st.radio(
+            "Select Page:", 
+            ["🖨️ Print Manager", "🔄 Convert & Format"], 
+            index=0,
+            help="Choose between printing files or converting documents"
+        )
+        
+        st.markdown("---")
+        st.markdown("## ℹ️ About")
+        st.markdown("""
+        **Autoprint Service** provides:
+        - 📄 Document conversion to PDF
+        - 🖨️ Professional printing services  
+        - 💳 Secure UPI payment integration
+        - 📱 Real-time status updates
+        - 🔄 Multi-format file support
+        """)
+        
+        # Show current session info
+        if st.session_state.get("user_name"):
+            st.markdown(f"**👤 User:** {st.session_state['user_name']}")
+        st.markdown(f"**🆔 Session:** `{st.session_state.get('user_id', 'unknown')}`")
+        
+        # Show current job status
+        if st.session_state.get("current_job_id"):
+            st.markdown(f"**📋 Active Job:** `{st.session_state['current_job_id'][:8]}...`")
+        
+        # Emergency reset
+        st.markdown("---")
+        if st.button("🔄 **Reset Session**", help="Clear all data and start fresh"):
+            for key in list(st.session_state.keys()):
+                del st.session_state[key]
+            st.rerun()
+
+    # Main content area
+    if "Print Manager" in page:
         render_print_manager_page()
     else:
         render_convert_page()
-    st.markdown("<div style='text-align:center;color:#666;padding-top:6px;'>Autoprint — Firestore Sender</div>", unsafe_allow_html=True)
+
+    # Footer
+    st.markdown("---")
+    col1, col2, col3 = st.columns([1,2,1])
+    with col2:
+        st.markdown(
+            "<div style='text-align:center;color:#666;padding:10px;'>🖨️ <b>Autoprint Service</b> - Professional Document Printing with UPI Integration</div>", 
+            unsafe_allow_html=True
+        )
 
 if __name__ == "__main__":
-    main() 
+    main()
