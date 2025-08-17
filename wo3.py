@@ -1,5 +1,7 @@
-# wo3_autoprint_fixed_pages_firestore_sender.py — Streamlit sender replaced sockets with Firestore
-# Run: streamlit run wo3_autoprint_fixed_pages_firestore_sender.py
+# wo3_autoprint_fixed_pages_firestore_sender_complete.py
+# Streamlit sender that uploads chunked base64 docs + manifest to Firestore
+# Works with the receiver you shared (manifest: {file_id}_meta, chunks: {file_id}_{idx})
+# Put your service account JSON into Streamlit Secrets key: "firebase_service_account"
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -23,7 +25,7 @@ import datetime
 import uuid
 import webbrowser
 import threading
-import io                                  # <-- added for BytesIO
+import io
 
 # Firestore imports (firebase_admin)
 try:
@@ -162,11 +164,11 @@ def retry_with_backoff(func, attempts=3, initial_delay=0.5, factor=2.0, *args, *
             return func(*args, **kwargs)
         except Exception as e:
             last_exc = e
-            log(f"Attempt {i+1}/{attempts} failed for {func.__name__}: {e}", "warning")
+            log(f"Attempt {i+1}/{attempts} failed for {getattr(func,'__name__',str(func))}: {e}", "warning")
             logger.debug(traceback.format_exc())
             time.sleep(delay)
             delay *= factor
-    log(f"All {attempts} attempts failed for {func.__name__}", "error")
+    log(f"All {attempts} attempts failed for {getattr(func,'__name__',str(func))}", "error")
     if last_exc:
         raise last_exc
     return None
@@ -620,9 +622,11 @@ def init_firestore_from_st_secrets():
         else:
             # string: parse JSON
             sa = json.loads(svc)
-        # fix windows-style escaped private_key linebreaks
+        # fix escaped private_key newline sequences
         if "private_key" in sa and isinstance(sa["private_key"], str):
             sa["private_key"] = sa["private_key"].replace("\\n", "\n")
+        if firebase_admin is None or credentials is None or firestore is None:
+            raise RuntimeError("firebase_admin SDK not available in environment. Install firebase-admin.")
         try:
             firebase_admin.get_app()
         except ValueError:
@@ -640,7 +644,7 @@ def init_firestore_from_st_secrets():
 init_firestore_from_st_secrets()
 if not FIRESTORE_OK:
     st.error("Firestore init failed. Add your service account JSON to Streamlit secrets under key 'firebase_service_account'.")
-    # We still continue, but send will report errors.
+    # continue, but send will report errors
 
 # Helper id functions (match receiver)
 def meta_doc_id(file_id: str) -> str:
@@ -652,9 +656,7 @@ def chunk_doc_id(file_id: str, idx: int) -> str:
 def sha256_bytes(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
-# --------- Removed socket code; replaced with Firestore uploader ---------
-
-# Session keys for print manager
+# --------- Session keys for print manager ----------
 if "payinfo" not in st.session_state:
     st.session_state["payinfo"] = None
 if "status" not in st.session_state:
@@ -686,6 +688,7 @@ def send_multiple_files(converted_files: List[ConvertedFile], copies: int, color
       - Write manifest doc {collection}/{file_id}_meta with total_chunks, file_name, sha256, settings and user info
     Then poll the manifest for 'payinfo' written by the receiver and return it to UI.
     """
+    global db, FIRESTORE_OK
     if not FIRESTORE_OK or db is None:
         st.error("Firestore is not initialized. Check st.secrets['firebase_service_account'].")
         return
@@ -725,25 +728,6 @@ def send_multiple_files(converted_files: List[ConvertedFile], copies: int, color
             })
             total_bytes += size
 
-        metadata = {
-            "job_id": job_id,
-            "file_count": len(files_meta),
-            "total_size_bytes": total_bytes,
-            "files": [
-                {
-                    "file_id": m["file_id"],
-                    "filename": m["filename"],
-                    "orig_filename": m["orig_filename"],
-                    "size_bytes": m["size_bytes"],
-                    "pages": m["pages"]
-                } for m in files_meta
-            ],
-            "user_name": st.session_state.get("user_name") or "",
-            "user_id": st.session_state.get("user_id"),
-            "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "transfer_mode": "firestore_chunks"
-        }
-
         set_status("Starting upload of chunks...")
         progress_bar = st.progress(0.0)
         total_chunks_all = 0
@@ -755,22 +739,30 @@ def send_multiple_files(converted_files: List[ConvertedFile], copies: int, color
             b64 = base64.b64encode(blob).decode("utf-8")  # contiguous base64 string
             # split base64 string into CHUNK_SIZE-character pieces (safe to rejoin)
             parts = [b64[i:i+CHUNK_SIZE] for i in range(0, len(b64), CHUNK_SIZE)]
-            total_chunks_all += len(parts)
             file_meta["total_chunks"] = len(parts)
             file_meta["sha256"] = sha256_bytes(blob)
             file_meta["file_name"] = file_meta["filename"]
+            total_chunks_all += len(parts)
 
-            # upload chunk docs
             fid = file_meta["file_id"]
+            # upload chunk docs
             for idx, piece in enumerate(parts):
                 doc_ref = db.collection(COLLECTION).document(chunk_doc_id(fid, idx))
-                # small payload: data is base64 string; include chunk_index for receiver convenience
+                # include chunk_index for receiver convenience
                 retry_with_backoff(lambda d=doc_ref, p=piece, i=idx: d.set({"data": p, "chunk_index": i}), attempts=3)
                 uploaded_chunks += 1
-                # update progress
+                # update progress safely
                 if total_chunks_all > 0:
-                    progress_bar.progress(min(1.0, uploaded_chunks/ (total_chunks_all)))
-        progress_bar.progress(1.0)
+                    try:
+                        progress_bar.progress(min(1.0, uploaded_chunks / float(total_chunks_all)))
+                    except Exception:
+                        pass
+
+        try:
+            progress_bar.progress(1.0)
+        except Exception:
+            pass
+
         set_status(f"Uploaded {uploaded_chunks} chunks for {len(files_meta)} file(s). Writing manifests...")
 
         # Now write meta docs for each file (manifest)
@@ -785,18 +777,22 @@ def send_multiple_files(converted_files: List[ConvertedFile], copies: int, color
                 "user_id": st.session_state.get("user_id"),
                 "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "job_id": job_id,
-                # Optionally include a summary of files in this job
                 "file_size_bytes": int(file_meta.get("size_bytes", 0)),
             }
-            # write manifest (create)
-            retry_with_backoff(lambda d=db.collection(COLLECTION).document(meta_doc_id(fid)).set(meta_doc, merge=True), attempts=3)
+
+            # Use a small inner function to avoid lambda syntax pitfalls
+            def _write_meta_document(mref=db.collection(COLLECTION).document(meta_doc_id(fid)), data=meta_doc):
+                # write manifest (merge to avoid overwriting)
+                mref.set(data, merge=True)
+
+            retry_with_backoff(_write_meta_document, attempts=3)
             set_status(f"Manifest written for {file_meta['file_name']} (id={fid})")
 
         # Everything uploaded — now poll manifests for payinfo
         set_status("All manifests created — waiting for payment info on each manifest...")
         payinfo_collected = {}
         payinfo_timeout = 60  # seconds to wait for payinfo per file (tunable)
-        start_overall = time.time()
+
         for file_meta in files_meta:
             fid = file_meta["file_id"]
             meta_ref = db.collection(COLLECTION).document(meta_doc_id(fid))
@@ -804,24 +800,23 @@ def send_multiple_files(converted_files: List[ConvertedFile], copies: int, color
             got = False
             while time.time() - start < payinfo_timeout:
                 try:
-                    meta_doc = meta_ref.get()
-                    if meta_doc.exists:
-                        md = meta_doc.to_dict() or {}
+                    meta_doc_snap = meta_ref.get()
+                    if meta_doc_snap.exists:
+                        md = meta_doc_snap.to_dict() or {}
                         if "payinfo" in md and md["payinfo"]:
                             payinfo_collected[fid] = md["payinfo"]
                             got = True
                             set_status(f"Payment info available for {file_meta['file_name']}")
                             break
                     time.sleep(1.0)
-                except Exception as e:
+                except Exception:
                     logger.debug(traceback.format_exc())
                     time.sleep(1.0)
             if not got:
-                set_status(f"No payment info for {file_meta['file_name']} after {payinfo_timeout}s (will continue).")
+                set_status(f"No payment info for {file_meta['file_name']} after {payinfo_timeout}s (continuing).")
 
         # If at least one payinfo found, show the first to user (mimic previous behavior)
         if payinfo_collected:
-            # pick first payinfo
             first_fid, first_pay = next(iter(payinfo_collected.items()))
             st.session_state["payinfo"] = first_pay
             set_status("Payment information received from receiver.")
@@ -831,9 +826,9 @@ def send_multiple_files(converted_files: List[ConvertedFile], copies: int, color
             meta_ref = db.collection(COLLECTION).document(meta_doc_id(first_fid))
             while time.time() - ack_start < ack_timeout:
                 try:
-                    meta_doc = meta_ref.get()
-                    if meta_doc.exists:
-                        md = meta_doc.to_dict() or {}
+                    meta_doc_snap = meta_ref.get()
+                    if meta_doc_snap.exists:
+                        md = meta_doc_snap.to_dict() or {}
                         pay = md.get("payinfo")
                         if isinstance(pay, dict) and pay.get("status") and pay.get("status") != first_pay.get("status"):
                             # status changed (e.g., to printed) -> consider as final ack
@@ -849,7 +844,6 @@ def send_multiple_files(converted_files: List[ConvertedFile], copies: int, color
                     time.sleep(1.0)
                 except Exception:
                     time.sleep(1.0)
-            # done watching
         else:
             set_status("No payinfo received for any file within timeout.")
 
