@@ -26,6 +26,8 @@ import threading
 import io                                  # <-- for BytesIO
 import queue
 import zlib
+from typing import Tuple
+
 
 # Firebase
 import firebase_admin
@@ -1150,3 +1152,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
