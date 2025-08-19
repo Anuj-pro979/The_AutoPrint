@@ -22,7 +22,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Enhanced CSS with mobile-first responsive design + print service styling
+# Enhanced CSS with modern glassmorphism design
 st.markdown(
     """
     <style>
@@ -180,6 +180,11 @@ st.markdown(
         color: #007aff;
     }
     
+    .status-printed {
+        background: rgba(52, 199, 89, 0.2);
+        color: #34c759;
+    }
+    
     /* Print settings panel */
     .print-settings {
         background: rgba(255,255,255,0.05);
@@ -187,6 +192,15 @@ st.markdown(
         padding: 1rem;
         margin: 1rem 0;
         border: 1px solid rgba(255,255,255,0.1);
+    }
+    
+    /* Job status cards */
+    .job-card {
+        background: linear-gradient(135deg, rgba(255,255,255,0.08) 0%, rgba(255,255,255,0.04) 100%);
+        border: 1px solid rgba(255,255,255,0.1);
+        border-radius: 12px;
+        padding: 1rem;
+        margin-bottom: 0.75rem;
     }
     
     /* Responsive design */
@@ -220,7 +234,7 @@ st.markdown(
     
     /* Theme adjustments */
     @media (prefers-color-scheme: light) {
-        .file-container {
+        .file-container, .job-card {
             background: linear-gradient(135deg, rgba(0,0,0,0.05) 0%, rgba(0,0,0,0.02) 100%);
             border-color: rgba(0,0,0,0.1);
         }
@@ -244,18 +258,23 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Helper functions for Firestore
-def retry_with_backoff(fn, max_attempts=3, initial_delay=1.0, factor=2.0):
-    """Simplified retry logic"""
+# Helper functions for robust Firestore operations
+def retry_with_backoff(fn, max_attempts=5, initial_delay=1.0, factor=2.0, exceptions=(Exception,), log_fn=None):
+    """Enhanced retry logic with exponential backoff"""
     attempt = 0
     while True:
         try:
             return fn()
-        except Exception as e:
+        except exceptions as e:
             attempt += 1
             if attempt >= max_attempts:
                 raise
             delay = initial_delay * (factor ** (attempt - 1))
+            if log_fn:
+                try:
+                    log_fn(f"Attempt {attempt}/{max_attempts} failed: {e}. Retrying in {delay:.1f}s...")
+                except Exception:
+                    pass
             time.sleep(delay)
 
 def init_firestore_from_uploaded_file(uploaded_file):
@@ -267,7 +286,7 @@ def init_firestore_from_uploaded_file(uploaded_file):
         raw = uploaded_file.read()
         sa_dict = json.loads(raw.decode('utf-8'))
         
-        # Normalize private key
+        # Normalize private key safely
         if 'private_key' in sa_dict and isinstance(sa_dict['private_key'], str):
             sa_dict['private_key'] = sa_dict['private_key'].replace('\\n', '\n').replace('\\r\\n', '\n')
         
@@ -283,21 +302,91 @@ def init_firestore_from_uploaded_file(uploaded_file):
         st.error(f"Failed to initialize Firestore: {e}")
         return None
 
-def send_to_print_service(db, file_data, print_settings, user_info):
-    """Send file to print service via Firestore"""
+def sha256_hex(b: bytes) -> str:
+    """Calculate SHA256 hash of bytes"""
+    return hashlib.sha256(b).hexdigest()
+
+def compress_if_needed(b: bytes, do_compress: bool):
+    """Compress bytes if requested"""
+    return zlib.compress(b) if do_compress else b
+
+def split_base64_into_chunks(b64_full: str, chunk_size_chars: int):
+    """Split base64 string into chunks"""
+    return [b64_full[i:i + chunk_size_chars] for i in range(0, len(b64_full), chunk_size_chars)]
+
+def upload_chunks_in_batches(db, collection: str, file_id: str, chunks: list, log_fn=None, batch_size=300):
+    """Upload file chunks in batches to Firestore"""
+    total_chunks = len(chunks)
+    idx = 0
+    
+    while idx < total_chunks:
+        batch = db.batch()
+        end = min(idx + batch_size, total_chunks)
+        
+        for i in range(idx, end):
+            doc_ref = db.collection(collection).document(f"{file_id}_{i}")
+            batch.set(doc_ref, {"chunk_index": i, "data": chunks[i]})
+
+        def _commit():
+            batch.commit()
+            return True
+
+        retry_with_backoff(
+            _commit, 
+            max_attempts=6, 
+            initial_delay=1.0, 
+            factor=2.0, 
+            exceptions=(Exception,), 
+            log_fn=log_fn
+        )
+        
+        if log_fn:
+            log_fn(f"Committed chunks {idx}..{end - 1}")
+        idx = end
+    
+    return total_chunks
+
+def write_manifest(db, collection: str, file_id: str, manifest: dict, log_fn=None):
+    """Write manifest document to Firestore"""
+    meta_doc_id = f"{file_id}_meta"
+
+    def _set():
+        db.collection(collection).document(meta_doc_id).set(manifest)
+        return True
+
+    retry_with_backoff(
+        _set, 
+        max_attempts=6, 
+        initial_delay=1.0, 
+        factor=2.0, 
+        exceptions=(Exception,), 
+        log_fn=log_fn
+    )
+    
+    if log_fn:
+        log_fn(f"Wrote manifest {meta_doc_id}")
+
+def send_to_print_service(db, file_data, print_settings, user_info, log_fn=None):
+    """Enhanced print service with chunking and robust error handling"""
     try:
         file_id = uuid.uuid4().hex
         raw_bytes = file_data['current_bytes']
         
-        # Compress and encode
-        compressed = zlib.compress(raw_bytes) if print_settings.get('compress', True) else raw_bytes
+        # Calculate hash and compress if needed
+        sha = sha256_hex(raw_bytes)
+        compressed = compress_if_needed(raw_bytes, print_settings.get('compress', True))
         b64_data = base64.b64encode(compressed).decode('ascii')
+        
+        # Split into chunks if large
+        chunk_size_kb = print_settings.get('chunk_size_kb', 128)
+        chunk_size_chars = chunk_size_kb * 1024
+        chunks = split_base64_into_chunks(b64_data, chunk_size_chars)
         
         # Create manifest
         manifest = {
             "file_name": file_data['filename'],
-            "total_chunks": 1,  # Simplified - single chunk for small files
-            "sha256": hashlib.sha256(raw_bytes).hexdigest(),
+            "total_chunks": len(chunks),
+            "sha256": sha,
             "settings": {
                 "copies": print_settings.get('copies', 1),
                 "colorMode": print_settings.get('color_mode', 'bw'),
@@ -311,18 +400,49 @@ def send_to_print_service(db, file_data, print_settings, user_info):
         
         collection = print_settings.get('collection', 'files')
         
-        # Write data chunk
-        chunk_doc_ref = db.collection(collection).document(f"{file_id}_0")
-        chunk_doc_ref.set({"chunk_index": 0, "data": b64_data})
+        # Write manifest first if requested
+        if print_settings.get('create_manifest_first', True):
+            initial_manifest = manifest.copy()
+            initial_manifest['total_chunks'] = 0  # Will be updated later
+            write_manifest(db, collection, file_id, initial_manifest, log_fn)
         
-        # Write manifest
-        meta_doc_ref = db.collection(collection).document(f"{file_id}_meta")
-        meta_doc_ref.set(manifest)
+        # Upload chunks in batches
+        total_chunks = upload_chunks_in_batches(
+            db, collection, file_id, chunks, 
+            log_fn=log_fn, 
+            batch_size=print_settings.get('batch_size', 300)
+        )
+        
+        # Update manifest with final chunk count
+        manifest['total_chunks'] = total_chunks
+        write_manifest(db, collection, file_id, manifest, log_fn)
         
         return file_id, True
+        
     except Exception as e:
-        st.error(f"Print service error: {e}")
+        if log_fn:
+            log_fn(f"Print service error: {e}")
         return None, False
+
+def check_job_status(db, collection: str, file_id: str):
+    """Check print job status from Firestore"""
+    try:
+        doc = db.collection(collection).document(f"{file_id}_meta").get()
+        if doc.exists:
+            return doc.to_dict()
+        return None
+    except Exception as e:
+        st.error(f"Error checking status: {e}")
+        return None
+
+def format_timestamp(timestamp):
+    """Format timestamp for display"""
+    try:
+        if isinstance(timestamp, (int, float)):
+            return datetime.fromtimestamp(timestamp).strftime('%d %b %Y, %H:%M:%S')
+        return str(timestamp)
+    except Exception:
+        return "N/A"
 
 # Header
 st.markdown("""
@@ -331,7 +451,7 @@ st.markdown("""
             📄 PDF Editor & Print Service
         </h1>
         <p style="font-size: 1.1rem; color: #8e8e93; margin: 0;">
-            Edit PDFs and send them to print with ease
+            Edit PDFs online and send them to print with advanced features
         </p>
     </div>
 """, unsafe_allow_html=True)
@@ -366,17 +486,26 @@ with st.sidebar:
     # User information
     st.subheader("👤 User Information")
     user_name = st.text_input("Name", value="User")
+    user_id = st.text_input("User ID", value=str(uuid.uuid4())[:8])
     user_email = st.text_input("Email", placeholder="user@example.com")
     
     st.markdown("---")
     
     # Print settings
     st.subheader("🖨️ Print Settings")
-    copies = st.number_input("Copies", min_value=1, max_value=10, value=1)
+    copies = st.number_input("Copies", min_value=1, max_value=100, value=1)
     color_mode = st.selectbox("Color Mode", ["bw", "color"], index=0)
     duplex = st.selectbox("Duplex", ["one-sided", "two-sided"], index=0)
     printer_name = st.text_input("Printer Name", placeholder="Optional")
+    
+    st.markdown("---")
+    
+    # Advanced settings
+    st.subheader("⚙️ Advanced Settings")
     compress = st.checkbox("Compress Files", value=True)
+    chunk_size_kb = st.number_input("Chunk Size (KB)", min_value=16, max_value=256, value=128, step=8)
+    batch_size = st.number_input("Batch Size", min_value=50, max_value=500, value=300, step=50)
+    create_manifest_first = st.checkbox("Create Manifest First", value=True)
 
 # Initialize session state
 if 'files_data' not in st.session_state:
@@ -404,7 +533,7 @@ if uploaded_files:
                 'original_bytes': file_bytes,
                 'current_bytes': file_bytes,
                 'edited': False,
-                'uploaded_at': int(time.time() * 1000),
+                'uploaded_at': int(time.time()),
                 'filename': uploaded_file.name
             }
 
@@ -427,349 +556,80 @@ else:
         </div>
     """, unsafe_allow_html=True)
 
-    # Render file cards with full editor integration
+    # Render file cards
     for filename, fd in st.session_state['files_data'].items():
         file_key = filename.replace('.', '_').replace(' ', '_').replace('-', '_')
         EDITOR_URL = "https://anuj-pro979.github.io/printdilog/"
-        TARGET_ORIGIN = "https://anuj-pro979.github.io"
 
-        uploaded_ts = fd.get('uploaded_at', 0)
-        uploaded_time_str = time.strftime('%d %b %Y, %H:%M', time.localtime(uploaded_ts/1000)) if uploaded_ts else ""
+        uploaded_time_str = format_timestamp(fd.get('uploaded_at', 0))
         file_size_mb = round(len(fd['current_bytes']) / (1024 * 1024), 2) if fd['current_bytes'] else 0
         
         status_badge = "status-edited" if fd.get('edited') else "status-uploaded"
         status_text = "Edited" if fd.get('edited') else "Ready"
         status_icon = "✏️" if fd.get('edited') else "📤"
-        
-        with col1:
-            st.markdown(f"""
-                <div class="file-container">
-                    <div class="file-header">
-                        <div class="file-icon">📄</div>
-                        <div class="file-info">
-                            <h3 class="filename">{filename}</h3>
-                            <div class="status-badge {status_badge}">
-                                <span>{status_icon}</span>
-                                <span>{status_text}</span>
-                            </div>
-                        </div>
-                    </div>
-                    
-                    <div class="file-meta">
-                        <div class="meta-item">
-                            <span>📅</span>
-                            <span>{uploaded_time_str}</span>
-                        </div>
-                        <div class="meta-item">
-                            <span>📊</span>
-                            <span>{file_size_mb} MB</span>
+
+        # File card
+        st.markdown(f"""
+            <div class="file-container">
+                <div class="file-header">
+                    <div class="file-icon">📄</div>
+                    <div class="file-info">
+                        <h3 class="filename">{filename}</h3>
+                        <div class="status-badge {status_badge}">
+                            <span>{status_icon}</span>
+                            <span>{status_text}</span>
                         </div>
                     </div>
                 </div>
-            """, unsafe_allow_html=True)
-        
-        # Render full interactive file card with JavaScript
-        js_editor_url = json.dumps(EDITOR_URL)
-        js_target_origin = json.dumps(TARGET_ORIGIN)
-        js_file_key = json.dumps(file_key)
-        js_filename = json.dumps(filename)
-        js_base64 = json.dumps(fd['current_base64'])
-
-        html = f"""
-<div class="file-container">
-    <div class="file-header">
-        <div class="file-icon">📄</div>
-        <div class="file-info">
-            <h3 class="filename">{filename}</h3>
-            <div class="filename-label" id="label_{file_key}">{filename}</div>
-            <div class="status-badge {status_badge}">
-                <span>{status_icon}</span>
-                <span>{status_text}</span>
+                
+                <div class="file-meta">
+                    <div class="meta-item">
+                        <span>📅</span>
+                        <span>{uploaded_time_str}</span>
+                    </div>
+                    <div class="meta-item">
+                        <span>📊</span>
+                        <span>{file_size_mb} MB</span>
+                    </div>
+                </div>
             </div>
-        </div>
-    </div>
-    
-    <div class="file-meta">
-        <div class="meta-item">
-            <span>📅</span>
-            <span>{uploaded_time_str}</span>
-        </div>
-        <div class="meta-item">
-            <span>📊</span>
-            <span>{file_size_mb} MB</span>
-        </div>
-    </div>
-    
-    <div class="actions-container">
-        <button id="edit_{file_key}" class="action-btn btn-primary">
-            <span>✏️</span>
-            <span>Preview & Edit</span>
-        </button>
-        <button id="dl_{file_key}" class="action-btn btn-secondary">
-            <span>⬇️</span>
-            <span>Download</span>
-        </button>
-        <button id="print_{file_key}" class="action-btn btn-print">
-            <span>🖨️</span>
-            <span>Send to Print</span>
-        </button>
-    </div>
-</div>
-
-<script>
-(function(){{
-  const EDITOR_URL = {js_editor_url};
-  const TARGET_ORIGIN = {js_target_origin};
-  const fileKey = {js_file_key};
-  let filename = {js_filename};
-  let currentBase64 = {js_base64};
-  let popup = null;
-  let popupReady = false;
-  let pingInterval = null;
-  let lastBlobUrl = null;
-
-  function base64ToUint8Array(b64) {{
-    const bin = atob(b64);
-    const len = bin.length;
-    const arr = new Uint8Array(len);
-    for (let i = 0; i < len; i++) arr[i] = bin.charCodeAt(i);
-    return arr;
-  }}
-
-  function makeBlobUrlFromBase64(b64) {{
-    if (lastBlobUrl) {{
-      URL.revokeObjectURL(lastBlobUrl);
-      lastBlobUrl = null;
-    }}
-    const uint8 = base64ToUint8Array(b64);
-    const blob = new Blob([uint8], {{ type: "application/pdf" }});
-    const url = URL.createObjectURL(blob);
-    lastBlobUrl = url;
-    return url;
-  }}
-
-  function isDarkTheme() {{
-    try {{
-      if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {{
-        return true;
-      }} else if (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) {{
-        return false;
-      }}
-      try {{
-        const parentBody = window.parent && window.parent.document && window.parent.document.body;
-        if (parentBody) {{
-          const bg = window.parent.getComputedStyle(parentBody).backgroundColor;
-          if (bg) {{
-            const m = bg.match(/rgba?\\((\\d+),\\s*(\\d+),\\s*(\\d+)/i);
-            if (m) {{
-              const r = parseInt(m[1],10), g = parseInt(m[2],10), b = parseInt(m[3],10);
-              const brightness = (r*299 + g*587 + b*114) / 1000;
-              return brightness < 128;
-            }}
-          }}
-        }}
-      }} catch (e) {{}}
-    }} catch (e) {{}}
-    return false;
-  }}
-
-  function applyLabelColor() {{
-    const label = document.getElementById("label_" + fileKey);
-    if (!label) return;
-    const dark = isDarkTheme();
-    label.style.color = dark ? "#ffffff" : "#1a1a1a";
-  }}
-
-  function addLoadingState(button, loading) {{
-    if (loading) {{
-      button.classList.add('loading');
-      button.style.opacity = '0.6';
-      button.style.pointerEvents = 'none';
-      const originalText = button.innerHTML;
-      button.setAttribute('data-original', originalText);
-      button.innerHTML = '<span>⏳</span><span>Loading...</span>';
-    }} else {{
-      button.classList.remove('loading');
-      button.style.opacity = '1';
-      button.style.pointerEvents = 'auto';
-      const originalText = button.getAttribute('data-original');
-      if (originalText) button.innerHTML = originalText;
-    }}
-  }}
-
-  applyLabelColor();
-
-  if (window.matchMedia) {{
-    try {{
-      window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyLabelColor);
-      window.matchMedia('(prefers-color-scheme: light)').addEventListener('change', applyLabelColor);
-    }} catch (e) {{}}
-  }}
-
-  // Download functionality
-  const downloadBtn = document.getElementById("dl_" + fileKey);
-  downloadBtn.onclick = () => {{
-    addLoadingState(downloadBtn, true);
-    setTimeout(() => {{
-      const url = makeBlobUrlFromBase64(currentBase64);
-      const a = document.createElement("a");
-      a.href = url;
-      let dlName = filename;
-      if (!/\\.pdf$/i.test(dlName)) dlName = dlName + ".pdf";
-      a.download = dlName;
-      a.click();
-      addLoadingState(downloadBtn, false);
-    }}, 300);
-  }};
-
-  // Preview & Edit functionality
-  function openPopup() {{
-    const editBtn = document.getElementById("edit_" + fileKey);
-    addLoadingState(editBtn, true);
-    
-    if (!popup || popup.closed) {{
-      popup = window.open(EDITOR_URL, "printDialogPopup_" + fileKey, "width=1200,height=800,resizable,scrollbars");
-      if (!popup) {{
-        alert("Popup blocked. Please allow popups for this site to use the editor.");
-        addLoadingState(editBtn, false);
-        return;
-      }}
-      popupReady = false;
-      let attempts = 0;
-      pingInterval = setInterval(() => {{
-        if (!popup || popup.closed) {{ 
-          clearInterval(pingInterval); 
-          pingInterval = null; 
-          addLoadingState(editBtn, false);
-          return; 
-        }}
-        attempts++;
-        try {{ 
-          popup.postMessage({{ type: "ping", from: "sender" }}, TARGET_ORIGIN); 
-        }} catch(e){{
-          console.log("Ping failed:", e);
-        }}
-        if (attempts > 120) {{ 
-          clearInterval(pingInterval); 
-          pingInterval = null; 
-          addLoadingState(editBtn, false);
-          console.log("Editor connection timeout");
-        }}
-      }}, 300);
-    }} else {{
-      popup.focus();
-      if (popupReady) {{
-        sendFile();
-        addLoadingState(editBtn, false);
-      }}
-    }}
-  }}
-
-  function sendFile() {{
-    if (!popup || popup.closed || !popupReady) return;
-    try {{
-      popup.postMessage({{ 
-        type: "pdf_file_data", 
-        filename: filename, 
-        pdf_data: currentBase64 
-      }}, TARGET_ORIGIN);
-      console.log("Sent PDF data to editor:", filename);
-    }} catch (e) {{ 
-      console.error("Failed to send file to editor:", e); 
-    }}
-  }}
-
-  // Wire up edit button
-  document.getElementById("edit_" + fileKey).addEventListener("click", openPopup);
-
-  // Print functionality (will trigger Streamlit rerun)
-  const printBtn = document.getElementById("print_" + fileKey);
-  printBtn.onclick = () => {{
-    addLoadingState(printBtn, true);
-    // Send message to parent Streamlit to trigger print
-    try {{
-      window.parent.postMessage({{ 
-        type: "trigger_print", 
-        fileKey: fileKey,
-        filename: filename,
-        base64Data: currentBase64
-      }}, "*");
-    }} catch(e) {{
-      console.error("Failed to trigger print:", e);
-      addLoadingState(printBtn, false);
-    }}
-  }};
-
-  // Listen for messages from editor
-  window.addEventListener("message", (event) => {{
-    if (!event.origin || event.origin !== TARGET_ORIGIN) return;
-    const data = event.data || {{}};
-    if (event.source !== popup) return;
-
-    console.log("Received message from editor:", data.type);
-
-    if (data.type === "pdf_editor_ready") {{
-      console.log("Editor is ready");
-      popupReady = true;
-      if (pingInterval) {{ 
-        clearInterval(pingInterval); 
-        pingInterval = null; 
-      }}
-      sendFile();
-      const editBtn = document.getElementById("edit_" + fileKey);
-      addLoadingState(editBtn, false);
-    }}
-
-    if (data.type === "pdf_edited_data") {{
-      console.log("Received edited PDF data");
-      const editedBase64 = data.pdf_data;
-      const editedNameFromEditor = data.filename || filename;
-      const ts = Date.now();
-      const newName = (editedNameFromEditor.replace(/\\.pdf$/i, "") || filename.replace(/\\.pdf$/i,"")) + "_edited_" + ts + ".pdf";
-
-      currentBase64 = editedBase64;
-      filename = newName;
-
-      // Update the filename label
-      const label = document.getElementById("label_" + fileKey);
-      if (label) {{
-        label.textContent = filename;
-        applyLabelColor();
-      }}
-
-      // Update status badge to show edited
-      const statusBadge = label.parentNode.querySelector('.status-badge');
-      if (statusBadge) {{
-        statusBadge.className = 'status-badge status-edited';
-        statusBadge.innerHTML = '<span>✏️</span><span>Edited</span>';
-      }}
-
-      // Inform Streamlit about the edit
-      try {{ 
-        window.parent.postMessage({{ 
-          type: "pdf_file_edited_clientside", 
-          fileKey: fileKey,
-          filename: filename,
-          editedData: editedBase64
-        }}, "*"); 
-      }} catch(e){{
-        console.error("Failed to notify Streamlit:", e);
-      }}
-
-      console.log("File updated client-side:", filename);
-    }}
-  }});
-}})();
-</script>
-"""
-
-        # Render the interactive file card
-        components.html(html, height=320, scrolling=False)
-
-        # Handle print action from JavaScript
+        """, unsafe_allow_html=True)
+        
+        # Action buttons
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            if st.button(f"✏️ Edit", key=f"edit_{file_key}", use_container_width=True):
+                # JavaScript for editor popup
+                components.html(f"""
+                    <script>
+                    const editorWindow = window.open("{EDITOR_URL}", "editor", "width=1200,height=800,scrollbars=yes,resizable=yes");
+                    
+                    // Listen for messages from the editor
+                    window.addEventListener('message', function(event) {{
+                        if (event.origin !== "https://anuj-pro979.github.io") return;
+                        
+                        if (event.data.type === 'pdfEdited') {{
+                            console.log('PDF edited successfully');
+                            // The parent Streamlit app would need to handle this
+                        }}
+                    }});
+                    </script>
+                """, height=50)
+        
         with col2:
-            if st.button(f"🖨️ Print", key=f"print_{file_key}", use_container_width=True):
-                # Handle print functionality
+            if st.button(f"⬇️ Download", key=f"dl_{file_key}", use_container_width=True):
+                st.download_button(
+                    "📥 Download PDF",
+                    data=fd['current_bytes'],
+                    file_name=filename,
+                    mime="application/pdf",
+                    key=f"download_{file_key}"
+                )
+        
+        with col3:
+            # Print button
+            if db and st.button(f"🖨️ Print", key=f"print_{file_key}", use_container_width=True):
                 with st.spinner("Sending to print service..."):
                     print_settings = {
                         'copies': copies,
@@ -777,16 +637,27 @@ else:
                         'duplex': duplex,
                         'printer_name': printer_name,
                         'compress': compress,
-                        'collection': collection
+                        'collection': collection,
+                        'chunk_size_kb': chunk_size_kb,
+                        'batch_size': batch_size,
+                        'create_manifest_first': create_manifest_first
                     }
                     
                     user_info = {
                         'name': user_name,
-                        'id': str(uuid.uuid4()),
+                        'id': user_id,
                         'email': user_email if user_email else None
                     }
                     
-                    job_id, success = send_to_print_service(db, fd, print_settings, user_info)
+                    # Create log area
+                    log_area = st.empty()
+                    
+                    def log_progress(msg):
+                        log_area.text(msg)
+                    
+                    job_id, success = send_to_print_service(
+                        db, fd, print_settings, user_info, log_fn=log_progress
+                    )
                     
                     if success:
                         st.success(f"✅ Print job submitted! ID: {job_id[:8]}")
@@ -796,7 +667,7 @@ else:
                             'timestamp': time.time(),
                             'status': 'submitted'
                         })
-                        st.experimental_rerun()
+                        log_area.empty()
                     else:
                         st.error("❌ Print job failed")
 
@@ -805,47 +676,73 @@ if st.session_state.print_jobs:
     st.markdown("---")
     st.subheader("🖨️ Print Jobs Status")
     
-    for job in st.session_state.print_jobs[-5:]:  # Show last 5 jobs
-        with st.expander(f"Job: {job['filename']} ({job['job_id'][:8]})"):
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.write(f"**File:** {job['filename']}")
-                st.write(f"**Job ID:** {job['job_id']}")
-                st.write(f"**Status:** {job['status']}")
-            
-            with col2:
-                if st.button(f"Check Status", key=f"status_{job['job_id'][:8]}"):
-                    if db:
-                        try:
-                            doc = db.collection(collection).document(f"{job['job_id']}_meta").get()
-                            if doc.exists:
-                                data = doc.to_dict()
-                                st.json(data)
-                                
-                                # Check for payment info
-                                payinfo = data.get('payinfo')
-                                if payinfo:
-                                    st.success(f"💰 Payment: {payinfo.get('amount_str', 'N/A')} {payinfo.get('currency', '')}")
-                                    upi_url = payinfo.get('upi_url')
-                                    if upi_url:
-                                        st.link_button("💳 Pay via UPI", upi_url)
+    for idx, job in enumerate(st.session_state.print_jobs[-10:]):  # Show last 10 jobs
+        st.markdown(f"""
+            <div class="job-card">
+                <div style="display: flex; justify-content: between; align-items: center; margin-bottom: 0.5rem;">
+                    <strong>{job['filename']}</strong>
+                    <span style="font-size: 0.85rem; color: #8e8e93;">ID: {job['job_id'][:8]}</span>
+                </div>
+                <div style="font-size: 0.85rem; color: #8e8e93;">
+                    Submitted: {format_timestamp(job['timestamp'])}
+                </div>
+            </div>
+        """, unsafe_allow_html=True)
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if st.button(f"📊 Check Status", key=f"status_{job['job_id'][:8]}_{idx}"):
+                if db:
+                    status_data = check_job_status(db, collection, job['job_id'])
+                    if status_data:
+                        with st.expander(f"Status Details - {job['filename']}", expanded=True):
+                            st.json(status_data)
+                            
+                            # Check for payment info
+                            payinfo = status_data.get('payinfo')
+                            if payinfo:
+                                st.success(f"💰 Payment: {payinfo.get('amount_str', 'N/A')} {payinfo.get('currency', '')}")
+                                st.write("Payment Details:", payinfo)
                             else:
-                                st.warning("Job not found")
-                        except Exception as e:
-                            st.error(f"Error checking status: {e}")
+                                st.info("No payment information available yet.")
+                    else:
+                        st.warning("Job not found or manifest not created yet")
+        
+        with col2:
+            if st.button(f"💳 Pay/UPI", key=f"upi_{job['job_id'][:8]}_{idx}"):
+                if db:
+                    status_data = check_job_status(db, collection, job['job_id'])
+                    if status_data:
+                        payinfo = status_data.get('payinfo', {})
+                        upi_url = payinfo.get('upi_url') or status_data.get('upi_url')
+                        
+                        if upi_url:
+                            st.markdown(f"[🔗 Open UPI Payment]({upi_url})")
+                        else:
+                            st.info("No UPI payment URL available yet.")
+                    else:
+                        st.warning("Job not found")
 
-# Clear all files button
-if st.session_state.files_data:
-    if st.button("🗑️ Clear All Files", use_container_width=True):
+# Clear functions
+col1, col2 = st.columns(2)
+
+with col1:
+    if st.session_state.files_data and st.button("🗑️ Clear All Files", use_container_width=True):
         st.session_state.files_data = {}
+        st.experimental_rerun()
+
+with col2:
+    if st.session_state.print_jobs and st.button("🗑️ Clear Job History", use_container_width=True):
+        st.session_state.print_jobs = []
         st.experimental_rerun()
 
 # Footer
 st.markdown("---")
 st.markdown(
-    "<div style='text-align: center; color: #8e8e93; font-size: 0.9rem;'>"
-    "💡 Upload PDFs to edit them online or send them directly to print service"
-    "</div>", 
+    """<div style='text-align: center; color: #8e8e93; font-size: 0.9rem; padding: 1rem 0;'>
+    💡 <strong>Features:</strong> Upload PDFs • Edit online • Advanced print service with chunking • Job status tracking<br/>
+    🔒 <strong>Security Note:</strong> This tool is for testing only. Do not use in production with exposed service accounts.
+    </div>""", 
     unsafe_allow_html=True
 )
