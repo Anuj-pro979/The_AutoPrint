@@ -2,13 +2,13 @@
 Streamlit sender for the Firestore-based receiver (gui_auto_print_json_production_v2_firestore.py).
 
 Upgrades in this version:
-- Uses `st.secrets["firebase_service_account"]` by default (or falls back to an uploaded JSON).
-- Synchronous, reliable upload flow (avoids background-thread UI updates which are fragile in Streamlit).
-- Batch chunk uploads (to respect Firestore write limits). Commits batches of <=400 writes.
-- Safer default chunk size and enforced maximum to avoid Firestore doc size limits.
-- Handles service-account stored as JSON string or nested dict in `st.secrets`.
-- Adds compression flag in manifest.
-- Improved error handling and logging.
+- uses `st.secrets["firebase_service_account"]` by default (or falls back to an uploaded JSON).
+- synchronous, reliable upload flow (avoids fragile background-thread UI updates in Streamlit).
+- batch chunk uploads (to respect Firestore write limits). Commits batches of <=400 writes with retry/backoff.
+- added `retry_with_backoff` utility to make network operations resilient.
+- safer default chunk size and enforced maximum to avoid Firestore doc size limits.
+- handles service-account stored as JSON string or nested dict in `st.secrets`.
+- adds compression flag in manifest and improved error handling and logging.
 
 SECURITY NOTE: For production, never place service account credentials in a client app. Use a secure server-side upload or authenticated Firestore client with rules.
 
@@ -35,6 +35,34 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 
 # ----------------- Helpers -----------------
+
+def retry_with_backoff(fn, max_attempts=5, initial_delay=1.0, factor=2.0, exceptions=(Exception,), log_fn=None):
+    """
+    Retry function `fn` with exponential backoff on specified exceptions.
+    - fn: zero-arg callable that performs the operation and returns result.
+    - max_attempts: total attempts (including first).
+    - initial_delay: seconds before first retry.
+    - factor: multiplicative backoff factor.
+    - exceptions: tuple of exception classes to catch and retry on.
+    - log_fn: optional function to receive progress messages.
+    """
+    attempt = 0
+    while True:
+        try:
+            return fn()
+        except exceptions as e:
+            attempt += 1
+            if attempt >= max_attempts:
+                # re-raise the last exception
+                raise
+            delay = initial_delay * (factor ** (attempt - 1))
+            if log_fn:
+                try:
+                    log_fn(f"Attempt {attempt}/{max_attempts} failed: {e}. Retrying in {delay:.1f}s...")
+                except Exception:
+                    pass
+            time.sleep(delay)
+
 
 def init_firestore_from_dict_or_string(sa_value):
     """
@@ -101,30 +129,38 @@ def upload_chunks_in_batches(db, collection: str, file_id: str, parts: list, log
     """
     Upload chunk docs in batches to respect Firestore limits. Returns total_chunks.
     Each doc: id "{file_id}_{idx}" with fields {"chunk_index": idx, "data": part}
+    Implements retry_with_backoff for batch.commit().
     """
     total_chunks = len(parts)
     idx = 0
     while idx < total_chunks:
+        # prepare batch
         batch = db.batch()
         end = min(idx + batch_size, total_chunks)
         for i in range(idx, end):
             doc_ref = db.collection(collection).document(f"{file_id}_{i}")
             batch.set(doc_ref, {"chunk_index": i, "data": parts[i]})
-        try:
+
+        def _commit_batch():
             batch.commit()
-            if log_fn:
-                log_fn(f"Committed chunks {idx}..{end-1} in a batch.")
-        except Exception as e:
-            if log_fn:
-                log_fn(f"Batch commit failed at chunks {idx}..{end-1}: {e}")
-            raise
+            return True
+
+        # commit with retries
+        retry_with_backoff(_commit_batch, max_attempts=5, initial_delay=1.0, factor=2.0, exceptions=(Exception,), log_fn=log_fn)
+        if log_fn:
+            log_fn(f"Committed chunks {idx}..{end-1} in a batch.")
         idx = end
     return total_chunks
 
 
-def create_or_update_manifest(db, collection: str, file_id: str, manifest: dict):
+def create_or_update_manifest(db, collection: str, file_id: str, manifest: dict, log_fn=None):
     meta_doc_id = f"{file_id}_meta"
-    db.collection(collection).document(meta_doc_id).set(manifest)
+    def _set_manifest():
+        db.collection(collection).document(meta_doc_id).set(manifest)
+        return True
+    retry_with_backoff(_set_manifest, max_attempts=5, initial_delay=1.0, factor=2.0, exceptions=(Exception,), log_fn=log_fn)
+    if log_fn:
+        log_fn(f"Wrote manifest {meta_doc_id}")
     return manifest
 
 
@@ -142,7 +178,7 @@ def pretty_ts(x):
 # ----------------- Streamlit UI -----------------
 
 st.set_page_config(page_title="Firestore File Sender", layout="wide")
-st.title("Firestore File Sender — upgraded (uses st.secrets)")
+st.title("Firestore File Sender — upgraded (uses st.secrets) — retry/backoff fixed")
 
 st.info("This sender uploads files as chunk documents + manifest to Firestore. Prefer using st.secrets['firebase_service_account'] for local testing. Do not expose service accounts in production.")
 
@@ -238,7 +274,6 @@ if uploaded_files:
                             user_meta["email"] = user_email
 
                         # create manifest first if requested (with total_chunks=0 placeholder)
-                        meta_doc_id = f"{file_id}_meta"
                         if create_manifest_first:
                             initial_manifest = {
                                 "file_name": f.name,
@@ -249,7 +284,7 @@ if uploaded_files:
                                 "timestamp": int(time.time()),
                                 "compression": "zlib" if compressed_flag else "none"
                             }
-                            create_or_update_manifest(db, collection, file_id, initial_manifest)
+                            create_or_update_manifest(db, collection, file_id, initial_manifest, log_fn=lambda m: None)
 
                         # Prepare parts and upload in batches
                         parts = split_base64_into_parts(b64, chunk_size_chars)
@@ -270,7 +305,7 @@ if uploaded_files:
                             "timestamp": int(time.time()),
                             "compression": "zlib" if compressed_flag else "none"
                         }
-                        create_or_update_manifest(db, collection, file_id, manifest)
+                        create_or_update_manifest(db, collection, file_id, manifest, log_fn=log)
 
                         st.success(f"Upload complete for {f.name}. file_id={file_id}, chunks={total_chunks}")
                         st.session_state['sent_ids'].append({"file_id": file_id, "file_name": f.name})
