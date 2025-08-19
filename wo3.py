@@ -68,9 +68,7 @@ def init_firestore_from_uploaded_file(uploaded_file):
     # Normalize private_key safely (avoid embedding real newlines in source literals)
     if 'private_key' in sa_dict and isinstance(sa_dict['private_key'], str):
         # Replace literal backslash-n sequences with an actual newline
-        sa_dict['private_key'] = sa_dict['private_key'].replace('\n', '
-').replace('\r\n', '
-')
+        sa_dict['private_key'] = sa_dict['private_key'].replace('\n', '').replace('\r\n', '')
 
     try:
         firebase_admin.get_app()
@@ -283,3 +281,4 @@ if st.button("Clear sent IDs"):
     st.session_state['sent_ids'] = []
 
 st.caption("Reminder: Do not expose service-account credentials in a client app for production.")
+
