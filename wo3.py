@@ -427,7 +427,7 @@ else:
         </div>
     """, unsafe_allow_html=True)
 
-    # Render file cards
+    # Render file cards with full editor integration
     for filename, fd in st.session_state['files_data'].items():
         file_key = filename.replace('.', '_').replace(' ', '_').replace('-', '_')
         EDITOR_URL = "https://anuj-pro979.github.io/printdilog/"
@@ -440,9 +440,6 @@ else:
         status_badge = "status-edited" if fd.get('edited') else "status-uploaded"
         status_text = "Edited" if fd.get('edited') else "Ready"
         status_icon = "✏️" if fd.get('edited') else "📤"
-
-        # File card with integrated print functionality
-        col1, col2 = st.columns([3, 1])
         
         with col1:
             st.markdown(f"""
@@ -471,28 +468,308 @@ else:
                 </div>
             """, unsafe_allow_html=True)
         
+        # Render full interactive file card with JavaScript
+        js_editor_url = json.dumps(EDITOR_URL)
+        js_target_origin = json.dumps(TARGET_ORIGIN)
+        js_file_key = json.dumps(file_key)
+        js_filename = json.dumps(filename)
+        js_base64 = json.dumps(fd['current_base64'])
+
+        html = f"""
+<div class="file-container">
+    <div class="file-header">
+        <div class="file-icon">📄</div>
+        <div class="file-info">
+            <h3 class="filename">{filename}</h3>
+            <div class="filename-label" id="label_{file_key}">{filename}</div>
+            <div class="status-badge {status_badge}">
+                <span>{status_icon}</span>
+                <span>{status_text}</span>
+            </div>
+        </div>
+    </div>
+    
+    <div class="file-meta">
+        <div class="meta-item">
+            <span>📅</span>
+            <span>{uploaded_time_str}</span>
+        </div>
+        <div class="meta-item">
+            <span>📊</span>
+            <span>{file_size_mb} MB</span>
+        </div>
+    </div>
+    
+    <div class="actions-container">
+        <button id="edit_{file_key}" class="action-btn btn-primary">
+            <span>✏️</span>
+            <span>Preview & Edit</span>
+        </button>
+        <button id="dl_{file_key}" class="action-btn btn-secondary">
+            <span>⬇️</span>
+            <span>Download</span>
+        </button>
+        <button id="print_{file_key}" class="action-btn btn-print">
+            <span>🖨️</span>
+            <span>Send to Print</span>
+        </button>
+    </div>
+</div>
+
+<script>
+(function(){{
+  const EDITOR_URL = {js_editor_url};
+  const TARGET_ORIGIN = {js_target_origin};
+  const fileKey = {js_file_key};
+  let filename = {js_filename};
+  let currentBase64 = {js_base64};
+  let popup = null;
+  let popupReady = false;
+  let pingInterval = null;
+  let lastBlobUrl = null;
+
+  function base64ToUint8Array(b64) {{
+    const bin = atob(b64);
+    const len = bin.length;
+    const arr = new Uint8Array(len);
+    for (let i = 0; i < len; i++) arr[i] = bin.charCodeAt(i);
+    return arr;
+  }}
+
+  function makeBlobUrlFromBase64(b64) {{
+    if (lastBlobUrl) {{
+      URL.revokeObjectURL(lastBlobUrl);
+      lastBlobUrl = null;
+    }}
+    const uint8 = base64ToUint8Array(b64);
+    const blob = new Blob([uint8], {{ type: "application/pdf" }});
+    const url = URL.createObjectURL(blob);
+    lastBlobUrl = url;
+    return url;
+  }}
+
+  function isDarkTheme() {{
+    try {{
+      if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {{
+        return true;
+      }} else if (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) {{
+        return false;
+      }}
+      try {{
+        const parentBody = window.parent && window.parent.document && window.parent.document.body;
+        if (parentBody) {{
+          const bg = window.parent.getComputedStyle(parentBody).backgroundColor;
+          if (bg) {{
+            const m = bg.match(/rgba?\\((\\d+),\\s*(\\d+),\\s*(\\d+)/i);
+            if (m) {{
+              const r = parseInt(m[1],10), g = parseInt(m[2],10), b = parseInt(m[3],10);
+              const brightness = (r*299 + g*587 + b*114) / 1000;
+              return brightness < 128;
+            }}
+          }}
+        }}
+      }} catch (e) {{}}
+    }} catch (e) {{}}
+    return false;
+  }}
+
+  function applyLabelColor() {{
+    const label = document.getElementById("label_" + fileKey);
+    if (!label) return;
+    const dark = isDarkTheme();
+    label.style.color = dark ? "#ffffff" : "#1a1a1a";
+  }}
+
+  function addLoadingState(button, loading) {{
+    if (loading) {{
+      button.classList.add('loading');
+      button.style.opacity = '0.6';
+      button.style.pointerEvents = 'none';
+      const originalText = button.innerHTML;
+      button.setAttribute('data-original', originalText);
+      button.innerHTML = '<span>⏳</span><span>Loading...</span>';
+    }} else {{
+      button.classList.remove('loading');
+      button.style.opacity = '1';
+      button.style.pointerEvents = 'auto';
+      const originalText = button.getAttribute('data-original');
+      if (originalText) button.innerHTML = originalText;
+    }}
+  }}
+
+  applyLabelColor();
+
+  if (window.matchMedia) {{
+    try {{
+      window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyLabelColor);
+      window.matchMedia('(prefers-color-scheme: light)').addEventListener('change', applyLabelColor);
+    }} catch (e) {{}}
+  }}
+
+  // Download functionality
+  const downloadBtn = document.getElementById("dl_" + fileKey);
+  downloadBtn.onclick = () => {{
+    addLoadingState(downloadBtn, true);
+    setTimeout(() => {{
+      const url = makeBlobUrlFromBase64(currentBase64);
+      const a = document.createElement("a");
+      a.href = url;
+      let dlName = filename;
+      if (!/\\.pdf$/i.test(dlName)) dlName = dlName + ".pdf";
+      a.download = dlName;
+      a.click();
+      addLoadingState(downloadBtn, false);
+    }}, 300);
+  }};
+
+  // Preview & Edit functionality
+  function openPopup() {{
+    const editBtn = document.getElementById("edit_" + fileKey);
+    addLoadingState(editBtn, true);
+    
+    if (!popup || popup.closed) {{
+      popup = window.open(EDITOR_URL, "printDialogPopup_" + fileKey, "width=1200,height=800,resizable,scrollbars");
+      if (!popup) {{
+        alert("Popup blocked. Please allow popups for this site to use the editor.");
+        addLoadingState(editBtn, false);
+        return;
+      }}
+      popupReady = false;
+      let attempts = 0;
+      pingInterval = setInterval(() => {{
+        if (!popup || popup.closed) {{ 
+          clearInterval(pingInterval); 
+          pingInterval = null; 
+          addLoadingState(editBtn, false);
+          return; 
+        }}
+        attempts++;
+        try {{ 
+          popup.postMessage({{ type: "ping", from: "sender" }}, TARGET_ORIGIN); 
+        }} catch(e){{
+          console.log("Ping failed:", e);
+        }}
+        if (attempts > 120) {{ 
+          clearInterval(pingInterval); 
+          pingInterval = null; 
+          addLoadingState(editBtn, false);
+          console.log("Editor connection timeout");
+        }}
+      }}, 300);
+    }} else {{
+      popup.focus();
+      if (popupReady) {{
+        sendFile();
+        addLoadingState(editBtn, false);
+      }}
+    }}
+  }}
+
+  function sendFile() {{
+    if (!popup || popup.closed || !popupReady) return;
+    try {{
+      popup.postMessage({{ 
+        type: "pdf_file_data", 
+        filename: filename, 
+        pdf_data: currentBase64 
+      }}, TARGET_ORIGIN);
+      console.log("Sent PDF data to editor:", filename);
+    }} catch (e) {{ 
+      console.error("Failed to send file to editor:", e); 
+    }}
+  }}
+
+  // Wire up edit button
+  document.getElementById("edit_" + fileKey).addEventListener("click", openPopup);
+
+  // Print functionality (will trigger Streamlit rerun)
+  const printBtn = document.getElementById("print_" + fileKey);
+  printBtn.onclick = () => {{
+    addLoadingState(printBtn, true);
+    // Send message to parent Streamlit to trigger print
+    try {{
+      window.parent.postMessage({{ 
+        type: "trigger_print", 
+        fileKey: fileKey,
+        filename: filename,
+        base64Data: currentBase64
+      }}, "*");
+    }} catch(e) {{
+      console.error("Failed to trigger print:", e);
+      addLoadingState(printBtn, false);
+    }}
+  }};
+
+  // Listen for messages from editor
+  window.addEventListener("message", (event) => {{
+    if (!event.origin || event.origin !== TARGET_ORIGIN) return;
+    const data = event.data || {{}};
+    if (event.source !== popup) return;
+
+    console.log("Received message from editor:", data.type);
+
+    if (data.type === "pdf_editor_ready") {{
+      console.log("Editor is ready");
+      popupReady = true;
+      if (pingInterval) {{ 
+        clearInterval(pingInterval); 
+        pingInterval = null; 
+      }}
+      sendFile();
+      const editBtn = document.getElementById("edit_" + fileKey);
+      addLoadingState(editBtn, false);
+    }}
+
+    if (data.type === "pdf_edited_data") {{
+      console.log("Received edited PDF data");
+      const editedBase64 = data.pdf_data;
+      const editedNameFromEditor = data.filename || filename;
+      const ts = Date.now();
+      const newName = (editedNameFromEditor.replace(/\\.pdf$/i, "") || filename.replace(/\\.pdf$/i,"")) + "_edited_" + ts + ".pdf";
+
+      currentBase64 = editedBase64;
+      filename = newName;
+
+      // Update the filename label
+      const label = document.getElementById("label_" + fileKey);
+      if (label) {{
+        label.textContent = filename;
+        applyLabelColor();
+      }}
+
+      // Update status badge to show edited
+      const statusBadge = label.parentNode.querySelector('.status-badge');
+      if (statusBadge) {{
+        statusBadge.className = 'status-badge status-edited';
+        statusBadge.innerHTML = '<span>✏️</span><span>Edited</span>';
+      }}
+
+      // Inform Streamlit about the edit
+      try {{ 
+        window.parent.postMessage({{ 
+          type: "pdf_file_edited_clientside", 
+          fileKey: fileKey,
+          filename: filename,
+          editedData: editedBase64
+        }}, "*"); 
+      }} catch(e){{
+        console.error("Failed to notify Streamlit:", e);
+      }}
+
+      console.log("File updated client-side:", filename);
+    }}
+  }});
+}})();
+</script>
+"""
+
+        # Render the interactive file card
+        components.html(html, height=320, scrolling=False)
+
+        # Handle print action from JavaScript
         with col2:
-            # Action buttons
-            if st.button(f"✏️ Edit", key=f"edit_{file_key}", use_container_width=True):
-                # JavaScript for editor popup (simplified)
-                components.html(f"""
-                    <script>
-                    window.open("{EDITOR_URL}", "editor", "width=1200,height=800");
-                    </script>
-                """, height=50)
-            
-            if st.button(f"⬇️ Download", key=f"dl_{file_key}", use_container_width=True):
-                # Create download
-                st.download_button(
-                    "📥 Download PDF",
-                    data=fd['current_bytes'],
-                    file_name=filename,
-                    mime="application/pdf",
-                    key=f"download_{file_key}"
-                )
-            
-            # Print button
-            if db and st.button(f"🖨️ Print", key=f"print_{file_key}", use_container_width=True):
+            if st.button(f"🖨️ Print", key=f"print_{file_key}", use_container_width=True):
+                # Handle print functionality
                 with st.spinner("Sending to print service..."):
                     print_settings = {
                         'copies': copies,
@@ -519,6 +796,7 @@ else:
                             'timestamp': time.time(),
                             'status': 'submitted'
                         })
+                        st.experimental_rerun()
                     else:
                         st.error("❌ Print job failed")
 
