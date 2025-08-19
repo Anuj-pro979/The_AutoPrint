@@ -1,17 +1,16 @@
 """
-Streamlit sender for the Firestore-based receiver (fixed, whitespace-consistent).
+Streamlit Firestore Sender — uploader-only, fixed newline & indentation
 
-This file is a clean, runnable version. Key fixes made here:
-- All indentation uses 4 spaces consistently (no tabs).
-- No unterminated string literals when normalizing private_key; uses sa_dict['private_key'].replace('\n', '
-').
-- Robust Firestore initialization from st.secrets or uploaded JSON.
-- Exponential backoff retries around Firestore writes.
-- Batch chunk uploads (Firestore-friendly).
+This version **does not** use st.secrets at all (uploader-only per your request). It fixes the previous SyntaxError/IndentationError by:
+ - using only the uploaded service-account JSON (required),
+ - normalizing the private_key safely with `sa_dict['private_key'] = sa_dict['private_key'].replace('\n', '\n').replace('\r\n', '
+')` (no raw newline placed inside source strings),
+ - consistent 4-space indentation throughout,
+ - robust retry/backoff for Firestore writes and batched chunk commits.
 
-SECURITY NOTE: Do not expose service account credentials in production.
+Security: This example uploads a service account JSON from the UI and uses it to initialize firebase_admin. **Do not use this in production**; it's only for local testing.
 
-Dependencies:
+Install:
     pip install streamlit firebase-admin
 
 Run:
@@ -28,7 +27,7 @@ import time
 import json
 from datetime import datetime
 
-# Firebase admin
+# firebase-admin
 import firebase_admin
 from firebase_admin import credentials, firestore
 
@@ -36,9 +35,6 @@ from firebase_admin import credentials, firestore
 # ---------------- Helpers ----------------
 
 def retry_with_backoff(fn, max_attempts=5, initial_delay=1.0, factor=2.0, exceptions=(Exception,), log_fn=None):
-    """
-    Retry callable `fn` with exponential backoff.
-    """
     attempt = 0
     while True:
         try:
@@ -56,43 +52,26 @@ def retry_with_backoff(fn, max_attempts=5, initial_delay=1.0, factor=2.0, except
             time.sleep(delay)
 
 
-def init_firestore_from_secrets_or_upload(secrets_key="firebase_service_account", uploaded_file=None):
+def init_firestore_from_uploaded_file(uploaded_file):
     """
-    Initialize Firestore client using st.secrets[secrets_key] (preferred) or an uploaded JSON file.
-    Returns Firestore client.
+    Initialize firebase_admin from an uploaded service-account JSON file (UploadedFile).
+    Returns a Firestore client.
     """
-    sa_dict = None
+    if uploaded_file is None:
+        raise RuntimeError("Service account JSON must be uploaded in the sidebar.")
+    try:
+        raw = uploaded_file.read()
+        sa_dict = json.loads(raw.decode('utf-8'))
+    except Exception as e:
+        raise RuntimeError(f"Failed to parse uploaded service-account JSON: {e}")
 
-    # 1) try st.secrets
-    if secrets_key in st.secrets:
-        candidate = st.secrets[secrets_key]
-        if isinstance(candidate, str):
-            try:
-                sa_dict = json.loads(candidate)
-            except Exception:
-                raise RuntimeError("st.secrets['firebase_service_account'] must be a JSON string or dict")
-        elif isinstance(candidate, dict):
-            sa_dict = candidate
-        else:
-            raise RuntimeError("Unsupported format for st.secrets['firebase_service_account']")
-
-    # 2) fall back to uploaded file
-    if sa_dict is None and uploaded_file is not None:
-        try:
-            raw = uploaded_file.read()
-            sa_dict = json.loads(raw.decode('utf-8'))
-        except Exception as e:
-            raise RuntimeError(f"Uploaded service account JSON parse failed: {e}")
-
-    if sa_dict is None:
-        raise RuntimeError("No service account provided. Set st.secrets['firebase_service_account'] or upload a JSON file.")
-
-    # Normalize private_key newlines safely. Replace literal "\n" sequences with actual newlines.
+    # Normalize private_key safely (avoid embedding real newlines in source literals)
     if 'private_key' in sa_dict and isinstance(sa_dict['private_key'], str):
+        # Replace literal backslash-n sequences with an actual newline
         sa_dict['private_key'] = sa_dict['private_key'].replace('\n', '
+').replace('\r\n', '
 ')
 
-    # Initialize firebase_admin if not already
     try:
         firebase_admin.get_app()
     except ValueError:
@@ -160,20 +139,14 @@ def pretty_ts(x):
 
 # ---------------- Streamlit UI ----------------
 
-st.set_page_config(page_title="Firestore File Sender (fixed)", layout="wide")
-st.title("Firestore File Sender — fixed syntax & indentation")
+st.set_page_config(page_title="Firestore File Sender (uploader-only)", layout="wide")
+st.title("Firestore File Sender — uploader-only (no st.secrets)")
 
-st.info("Use st.secrets['firebase_service_account'] (preferred) or upload a service-account JSON. This tool is for local testing only.")
+st.info("Upload a Firebase service-account JSON in the sidebar. This tool is for local testing only; do not expose service accounts in production.")
 
 with st.sidebar:
     st.header("Connection & options")
-    use_secrets = "firebase_service_account" in st.secrets
-    if use_secrets:
-        st.success("Using st.secrets['firebase_service_account']")
-    else:
-        st.warning("No service account in st.secrets — you may upload a JSON here for testing (not for production)")
-
-    sa_upload = st.file_uploader("Upload service-account JSON (fallback)", type=["json"]) if not use_secrets else None
+    sa_upload = st.file_uploader("Upload service-account JSON (required)", type=["json"])
     collection = st.text_input("Firestore collection", value="files")
 
     st.markdown("---")
@@ -200,9 +173,9 @@ uploaded_files = st.file_uploader("Select file(s) to send", accept_multiple_file
 if 'sent_ids' not in st.session_state:
     st.session_state['sent_ids'] = []
 
-# Initialize Firestore
+# Initialize Firestore (uploader-only)
 try:
-    db = init_firestore_from_secrets_or_upload(secrets_key="firebase_service_account", uploaded_file=sa_upload)
+    db = init_firestore_from_uploaded_file(sa_upload)
 except Exception as e:
     st.error(f"Firestore init failed: {e}")
     st.stop()
